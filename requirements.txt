@@ -1,0 +1,15 @@
+# Core factory / upload (optional YouTube upload needs local OAuth — not in this repo)
+requests>=2.32.0
+websocket-client>=1.8.0
+google-api-python-client>=2.160.0
+google-auth-oauthlib>=1.2.1
+google-auth-httplib2>=0.2.0
+
+# Assembler + gates
+numpy>=1.26.0
+Pillow>=10.0.0
+PyYAML>=6.0.1
+ultralytics>=8.3.0
+open-clip-torch>=2.24.0
+rapidocr-onnxruntime>=1.3.24
+torch>=2.1.0

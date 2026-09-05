@@ -1,0 +1,66 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install minimal deps for import/syntax
+        run: |
+          python -m pip install --upgrade pip
+          pip install pyyaml pillow numpy
+
+      - name: Compile Python sources
+        run: |
+          python -m py_compile run.py video_assembler.py shot_gate.py photo_fallback.py
+
+      - name: Validate gold YAML
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+          import yaml
+          for p in [
+              Path("config.yaml"),
+              Path("config/video_assembler.yaml"),
+              Path("config/gold_standard_v3.yaml"),
+          ]:
+              data = yaml.safe_load(p.read_text(encoding="utf-8"))
+              assert isinstance(data, dict), p
+              print("ok", p, "keys", sorted(data)[:12])
+          PY
+
+      - name: Secret scrub check
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+          import re
+          bad = re.compile(
+              r"token\.pickle|client_secret|AIza[0-9A-Za-z_-]{20,}|sk-[A-Za-z0-9]{20,}|"
+              r"ghp_[A-Za-z0-9]{20,}|gho_[A-Za-z0-9]{20,}|C:\\Users\\yevhe",
+              re.I,
+          )
+          hits = []
+          for p in Path(".").rglob("*"):
+              if not p.is_file() or ".git" in p.parts:
+                  continue
+              if p.suffix.lower() not in {".py", ".md", ".yaml", ".yml", ".txt", ".json"}:
+                  continue
+              text = p.read_text(encoding="utf-8", errors="ignore")
+              if bad.search(text):
+                  hits.append(str(p))
+          if hits:
+              raise SystemExit("possible secret/path leak: " + ", ".join(hits))
+          print("secret scrub ok")
+          PY

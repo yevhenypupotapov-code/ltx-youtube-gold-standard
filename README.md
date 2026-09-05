@@ -1,3 +1,32 @@
+# ltx-youtube-gold-standard
+
+Private Gold Standard **v3.0** package for the LTX hybrid YouTube assembler (PASS).
+
+**No secrets / no media pools** are included. Point env vars at your local ComfyUI + pools.
+
+## Package layout
+
+| Path | Role |
+|------|------|
+| `video_assembler.py` | Timeline assemble, hold≤5s, phash, slidewin, hybrid mix |
+| `shot_gate.py` | YOLO / CLIP / OCR / luma gates |
+| `photo_fallback.py` | Photoreal desk stills from local `fallback_pool/` |
+| `run.py` | Factory entry (`--engine long`) |
+| `config/*.yaml` | Gold runtime + canonical twin |
+| `GOLD_STANDARD_v3.md` | Human checklist + gate table |
+| `.github/workflows/ci.yml` | Syntax + YAML + secret-scrub CI |
+
+## Quick start
+
+```bash
+cp .env.example .env   # edit paths
+pip install -r requirements.txt
+# populate ./fallback_pool with dark-office desk photos (not shipped)
+python -m py_compile run.py video_assembler.py shot_gate.py photo_fallback.py
+```
+
+---
+
 ﻿# GOLD STANDARD v3.0 — Winning Configuration
 
 **Purpose / Назначение:** зафиксировать проверенный PASS-конфиг для ежедневной фабрики LTX hybrid (11:00 / 18:00) и handoff. Не трогать Autopilot.
@@ -44,7 +73,7 @@
 3. **Weekly:** rotate pool 2–3 fresh stills (same allowlist theme).
 4. **Monitor LTX negatives** в логах (`logs/ltx_*.log`) — people/hands/faces/text/ui/bright rejects.
 5. **Monthly:** log YOLO/OCR reject counts (reason tags) → trim pool / prompts.
-6. Schedule: Task `YevhenLtxHybrid` → `D:\Tutorial\ltx-youtube\run_scheduled.ps1` → `run.py --engine long` (gold defaults, Autopilot NOT touched).
+6. Schedule: Schedule wrapper → `run.py --engine long` (gold defaults). Set `LTX_FACTORY`, `LTX_COMFY_PY`, `LTX_OUTPUT_DIR`, `LTX_FFMPEG` as needed.
 
 ---
 
@@ -57,6 +86,6 @@
 | `GOLD_STANDARD_v3.md` | this human doc |
 | `shot_gate.py` | YOLO/CLIP/OCR/luma constants |
 | `run_scheduled.ps1` | 11:00/18:00 wrapper |
-| `_ltx_patch/` sync | `C:\Users\yevhe\.openclaw\workspace\_ltx_patch\` |
+| Env vars | `LTX_FACTORY`, `LTX_COMFY_PY`, `LTX_OUTPUT_DIR`, `LTX_FFMPEG` |
 
 Backup prefix before edits: `*.bak.pre-gold-v3-YYYYMMDD-HHMM`
