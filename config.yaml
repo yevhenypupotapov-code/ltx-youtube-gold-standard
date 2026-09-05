@@ -1,0 +1,95 @@
+﻿# Winning Configuration / Gold Standard v3.0
+# Canonical docs: ../GOLD_STANDARD_v3.md + gold_standard_v3.yaml
+# PASS proof: https://youtu.be/58K_BqdM-_E (~28s dense > 44s padded junk)
+# Loaded by: video_assembler.load_assembler_config() / run.py --engine long
+
+max_still_hold_sec: 5.0
+min_semantic_score: 0.65
+min_motion_for_thumb: 0.4
+# Density: at least 1 unique visual asset per N seconds of audio
+min_unique_per_sec: 5.0
+# Soft-fail is default for scheduled runs; --strict-assemble forces hard abort
+default_soft_fail: true
+
+# --- Rhythm / diversity (gold v3) ---
+# Sliding Window Semantic Diversity: deque(maxlen=2) on super_category
+slide_window_exclusion_groups: 2
+phash_near_dup_max: 55
+reuse_min_gap_sec: 30.0
+
+# --- Dark office ---
+max_dark_office_mean_luma: 100.0
+min_laplacian_var: 100.0
+
+# --- YOLO person/hand/arm/face (mirrored in shot_gate.py) ---
+yolo:
+  person_hand_arm_face_conf: 0.15
+  other_classes_conf: 0.25
+  classes: [person, hand, arm, face]
+
+# --- CLIP allowlist (mirrored in shot_gate.ALLOWLIST_CONCEPTS) ---
+clip:
+  min_similarity: 0.22
+  allowlist:
+    - desk
+    - technology
+    - computer monitor
+    - keyboard
+    - workspace
+    - dark office
+
+# --- OCR RapidOCR ---
+ocr:
+  max_text_area_ratio: 0.05
+  # Brand logos on hardware OK if small (area ratio gate)
+  brand_logos_hardware_ok: true
+
+# --- Hybrid interleave ---
+hybrid:
+  stills_ratio: 0.70
+  ltx_ratio: 0.30
+  # LTX through same gates; fail -> same super_category still
+  ltx_fail_same_super_category_still: true
+
+# --- LTX prompt bias / negatives (mirrored in run.SAFETY_NEGATIVE + MOTION_BIAS) ---
+ltx:
+  prompt_bias:
+    - slow cinematic pan left over dark tech desk
+    - slow cinematic pan right over dark tech desk
+    - dark tech workspace cinematic
+  negatives:
+    - people
+    - hands
+    - faces
+    - text
+    - ui
+    - bright
+    - white
+    - daylight
+
+fallback_pool:
+  min_items_required: 10
+  max_items: 40
+  # Dark-office / desk / tech tags - NO faces, NO hands, NO people, NO garden
+  allowed_tags:
+    - workspace
+    - abstract_tech
+    - code
+    - server
+    - interface
+    - desk
+    - keyboard
+    - monitor_glow
+    - schematic
+    - cables
+    - laptop
+    - laptop_closed
+    - keyboard_macro
+    - monitor_code
+    - desk_wide
+    - cables_peripherals
+    - coffee_mug_dark
+    - notebook
+    - photo
+    - pcb
+  dir: fallback_pool
