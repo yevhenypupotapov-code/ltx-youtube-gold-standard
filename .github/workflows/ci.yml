@@ -55,6 +55,9 @@ jobs:
           for p in Path(".").rglob("*"):
               if not p.is_file() or ".git" in p.parts:
                   continue
+              # Skip the workflow that defines these patterns (self false-positive).
+              if p.parts[:2] == (".github", "workflows"):
+                  continue
               if p.suffix.lower() not in {".py", ".md", ".yaml", ".yml", ".txt", ".json"}:
                   continue
               text = p.read_text(encoding="utf-8", errors="ignore")
