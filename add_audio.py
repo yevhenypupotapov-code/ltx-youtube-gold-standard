@@ -1,4 +1,6 @@
 #!/usr/bin/env python3
+# Copyright (c) 2026 Yevhen Potapov. All rights reserved.
+# Part of ContentForge. See LICENSE in the repository root.
 """Add Edge-TTS voiceover to a silent LTX mp4.
 
 Never loops the video under a longer VO (that reads as AI spam).
