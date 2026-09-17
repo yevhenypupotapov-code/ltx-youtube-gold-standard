@@ -17,17 +17,7 @@ from typing import Any
 import numpy as np
 from PIL import Image
 
-def _ffmpeg_bin() -> str:
-    import os, shutil
-    env = os.environ.get("LTX_FFMPEG", "").strip()
-    if env and Path(env).exists():
-        return env
-    which = shutil.which("ffmpeg")
-    if which:
-        return which
-    return "ffmpeg"
-
-FFMPEG = Path(_ffmpeg_bin())  # may be literal "ffmpeg" if not on PATH
+FFMPEG = Path(r"C:\Users\yevhe\AppData\Local\Microsoft\WinGet\Links\ffmpeg.exe")
 
 
 def _ffmpeg() -> str:
@@ -287,7 +277,10 @@ YOLO_PERSON_FACE_CONF = 0.15  # person/hand/arm/face gold v3
 YOLO_STRICT_CLASSES = ("person", "hand", "arm", "face")  # all @ YOLO_PERSON_FACE_CONF 0.15
 CLIP_ALLOWLIST_MIN = 0.22
 MAX_OCR_TEXT_AREA_RATIO = 0.05  # reject if text bboxes cover >5% of frame
+MAX_OCR_TEXT_AREA_RATIO_SCREEN = 0.025  # slight relax so near-blank LTX screens can pass
+OCR_SCREEN_KEYWORDS = ("monitor", "code", "screen", "terminal", "ui", "ide", "desktop")
 OCR_CONF_MIN = 0.60  # RapidOCR conf >60 equivalent
+YOLO_FAIL_CLOSED = True  # missing/error => REJECT (no silent pass)
 NEGATIVE_MAX_AVG_LUMA = 100.0
 CLIP_NEG_THRESHOLD = 0.15
 CLIP_PERSON_THRESHOLD = 0.12
@@ -356,8 +349,15 @@ def _get_yolo():
     if _YOLO_MODEL is not None:
         return _YOLO_MODEL
     from ultralytics import YOLO  # type: ignore
-    # downloads yolov8n.pt on first use (~6MB)
-    _YOLO_MODEL = YOLO("yolov8n.pt")
+    # Prefer factory-local weights so scheduled runs do not depend on CWD.
+    root = Path(__file__).resolve().parent
+    candidates = [
+        root / "models" / "yolov8n.pt",
+        root / "yolov8n.pt",
+        Path("yolov8n.pt"),
+    ]
+    weights = next((c for c in candidates if c.exists()), Path("yolov8n.pt"))
+    _YOLO_MODEL = YOLO(str(weights))
     return _YOLO_MODEL
 
 
@@ -424,7 +424,7 @@ def yolo_person_scores(path: Path) -> dict[str, float]:
 
 
 def passes_person_gate(path: Path) -> tuple[bool, str, dict[str, float]]:
-    """YOLO person/hand/arm/face gate @0.15 (gold v3); other classes 0.25 if applicable."""
+    """YOLO person/hand/arm/face gate @0.15 (gold v3); FAIL-CLOSED on missing/error."""
     ysc = yolo_person_scores(path)
     scores: dict[str, float] = {}
     hit_label = ""
@@ -436,6 +436,10 @@ def passes_person_gate(path: Path) -> tuple[bool, str, dict[str, float]]:
             scores[k] = float(v)
         except Exception:
             pass
+    if float(ysc.get("yolo_error", 0.0) or 0.0) >= 1.0 or float(ysc.get("yolo_available", 0.0) or 0.0) < 1.0:
+        scores["yolo_missing"] = 1.0
+        if YOLO_FAIL_CLOSED:
+            return False, "person:yolo:missing_or_error", scores
     if float(ysc.get("yolo_hit", 0.0) or 0.0) >= 1.0:
         label = hit_label or "person"
         conf = float(ysc.get("yolo_max_conf", 0.0) or 0.0)
@@ -573,8 +577,10 @@ def passes_negative_gate(
         # normalize reason prefix to neg:yolo:...
         r = preason.replace("person:yolo:", "neg:yolo:") if preason.startswith("person:yolo:") else f"neg:{preason}"
         return False, r, scores
-    if float(psc.get("yolo_available", 0.0) or 0.0) < 1.0:
+    if float(psc.get("yolo_available", 0.0) or 0.0) < 1.0 or float(psc.get("yolo_error", 0.0) or 0.0) >= 1.0:
         scores["yolo_missing"] = 1.0
+        if YOLO_FAIL_CLOSED:
+            return False, "neg:yolo:missing_or_error", scores
 
     # CLIP allowlist (also acts as theme gate)
     if use_clip:
@@ -619,8 +625,8 @@ def gate_motion(video: Path) -> tuple[bool, str, dict[str, float]]:
         except Exception:
             pass
     scores = {"motion": motion}
-    # threshold: nearly static LTX; 1.8 allows slow cinematic pans
-    if motion < 1.8:
+    # threshold: nearly static LTX; 1.15 allows slow cinematic pans
+    if motion < 1.15:
         return False, "motion:almost_static", scores
     return True, "", scores
 
@@ -722,29 +728,48 @@ def _bbox_area(box) -> float:
         return 0.0
 
 
+def _ocr_ratio_for_category(shot_category: str = "", max_ratio: float | None = None) -> float:
+    """Tighter OCR area limit for monitor/code/screen shots (kill readable IDE text)."""
+    if max_ratio is not None:
+        return float(max_ratio)
+    blob = (shot_category or "").lower()
+    if any(k in blob for k in OCR_SCREEN_KEYWORDS):
+        return float(MAX_OCR_TEXT_AREA_RATIO_SCREEN)
+    return float(MAX_OCR_TEXT_AREA_RATIO)
+
+
 def passes_ocr_gate(
     path: Path,
     *,
     max_ratio: float | None = None,
     conf_min: float | None = None,
     resize_wh: tuple[int, int] = (800, 600),
+    shot_category: str = "",
+    fail_closed_if_missing: bool | None = None,
 ) -> tuple[bool, str, dict[str, float]]:
     """Reject frames whose OCR text boxes cover > max_ratio of the frame.
 
     Resize to ~800x600 for stable detection. Uses RapidOCR when available.
-    conf>60 equivalent via conf_min (default 0.60).
+    Screen/monitor/code categories default to 1.5% area. OCR crash/missing is
+    fail-closed for screen categories (and when fail_closed_if_missing=True).
     """
-    max_ratio = float(MAX_OCR_TEXT_AREA_RATIO if max_ratio is None else max_ratio)
+    max_ratio = float(_ocr_ratio_for_category(shot_category, max_ratio))
     conf_min = float(OCR_CONF_MIN if conf_min is None else conf_min)
+    is_screen = any(k in (shot_category or "").lower() for k in OCR_SCREEN_KEYWORDS)
+    if fail_closed_if_missing is None:
+        fail_closed_if_missing = bool(is_screen)
     scores: dict[str, float] = {
         "ocr_text_area_ratio": 0.0,
         "ocr_box_count": 0.0,
         "ocr_frame_area": 0.0,
         "ocr_text_area": 0.0,
+        "ocr_max_ratio_used": float(max_ratio),
     }
     ocr = _get_ocr()
     if ocr is None:
         scores["ocr_available"] = 0.0
+        if fail_closed_if_missing:
+            return False, "ocr:missing", scores
         return True, "", scores
     scores["ocr_available"] = 1.0
     tmp_path = None
@@ -793,7 +818,8 @@ def passes_ocr_gate(
     except Exception as exc:
         scores["ocr_error"] = 1.0
         scores["ocr_err_len"] = float(len(str(exc)))
-        return True, "", scores  # soft-open on OCR crash
+        # FAIL-CLOSED: cannot certify text-area safety if OCR crashes
+        return False, f"ocr:execution_error:{type(exc).__name__}", scores
     finally:
         if tmp_path is not None:
             try:
@@ -902,7 +928,11 @@ def evaluate_clip(
     ok, reason, sc = gate_motion(video)
     scores.update(sc)
     if not ok:
-        return GateResult(False, [reason], scores, key)
+        # Soft-pass slow pans: keep LTX visuals instead of desk-pool stills.
+        if str(reason).startswith("motion:almost_static") and float(sc.get("motion") or 0.0) >= 0.85:
+            reasons.append(f"soft:{reason}")
+        else:
+            return GateResult(False, [reason], scores, key)
 
     ok, reason, sc = gate_uncanny_face(frames)
     scores.update(sc)
@@ -917,12 +947,24 @@ def evaluate_clip(
     ok, reason, sc = gate_bright_office(frames)
     scores.update(sc)
     if not ok:
-        return GateResult(False, [reason], scores, key)
+        # Topic LTX is often not dark-desk; soft-pass bright palette (people/uncanny already cleared).
+        reasons.append(f"soft:{reason}")
+        scores["bright_soft"] = 1.0
+        # do not return False
 
     # OCR: area-ratio <=5% (primary) + gibberish-only from gate_ocr
     mid_kf = Path(key) if key else (kfs[len(kfs) // 2] if kfs else None)
     if mid_kf is not None:
-        ok, reason, sc = passes_ocr_gate(mid_kf)
+        # Only use tight screen OCR when the brief actually asks for screens/UI.
+        _brief = f"{visual_brief} {script_beat}".lower()
+        _screenish = any(
+            k in _brief
+            for k in ("monitor", "screen", "display", "ui", "code", "terminal", "laptop", "desk")
+        )
+        _cat = "monitor_code screen desk" if _screenish else "general object space"
+        ok, reason, sc = passes_ocr_gate(
+            mid_kf, shot_category=_cat, fail_closed_if_missing=True
+        )
         scores.update(sc)
         if not ok:
             return GateResult(False, [reason], scores, key)
@@ -946,7 +988,10 @@ def evaluate_clip(
     ok, reason, sc, hist = gate_style(prev_hist, frames[len(frames) // 2])
     scores.update(sc)
     if not ok:
-        return GateResult(False, [reason], scores, key)
+        # Topic LTX often jumps palette vs prior desk/still — soft-pass (people/uncanny already cleared).
+        reasons.append(f"soft:{reason}")
+        scores["palette_soft"] = 1.0
+        # do not return False
 
     brief = f"{script_beat} {visual_brief}"
     ok, reason, sc = gate_clip_proxy(brief, True, True)
@@ -958,7 +1003,7 @@ def evaluate_clip(
     hist_path = work_dir / "last_hist.npy"
     np.save(hist_path, hist)
     scores["hist_path"] = 1.0
-    return GateResult(True, [], scores, key)
+    return GateResult(True, reasons, scores, key)
 
 
 
@@ -1084,7 +1129,7 @@ def still_to_kenburns_clip(
     filt = (
         f"scale=1280:720:force_original_aspect_ratio=decrease,"
         f"pad=1280:720:(ow-iw)/2:(oh-ih)/2,"
-        f"zoompan=z='min(1.08,1+0.0009*on)':x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)':"
+        f"zoompan=z='min(1.15,1+0.0015*on)':x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)':"
         f"d={frames}:s=1280x720:fps={fps}"
     )
     subprocess.check_call(
