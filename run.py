@@ -1,3 +1,5 @@
+# Copyright (c) 2026 Yevhen Potapov. All rights reserved.
+# Part of ContentForge. See LICENSE in the repository root.
 from __future__ import annotations
 
 
