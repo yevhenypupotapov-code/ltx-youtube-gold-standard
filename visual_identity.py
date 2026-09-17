@@ -1,4 +1,6 @@
 # -*- coding: utf-8 -*-
+# Copyright (c) 2026 Yevhen Potapov. All rights reserved.
+# Part of ContentForge. See LICENSE in the repository root.
 """visual_identity.py -- give every release a distinct look.
 
 The factory does not repeat within a video; it repeats BETWEEN videos: same
