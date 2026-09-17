@@ -44,6 +44,203 @@ MIN_LAPLACIAN_VAR = 100.0
 class PipelineAbortError(Exception):
     """Hard abort: cannot assemble a QC-passing timeline."""
 
+def _load_pipeline_state(path: Path | None = None) -> dict:
+    p = path or (Path(__file__).resolve().parent / "pipeline_state.json")
+    try:
+        import json as _j
+        if p.exists():
+            return _j.loads(p.read_text(encoding="utf-8"))
+    except Exception:
+        pass
+    return {}
+
+
+def _save_pipeline_state(state: dict, path: Path | None = None) -> None:
+    p = path or (Path(__file__).resolve().parent / "pipeline_state.json")
+    import json as _j
+    p.write_text(_j.dumps(state, indent=2, ensure_ascii=False), encoding="utf-8")
+
+
+def get_blacklisted_stills(state: dict, cooldown_hours: int = 24) -> set[str]:
+    """Asset ids of stills used in recent runs (cooldown window)."""
+    from datetime import datetime
+
+    now = datetime.now()
+    out: set[str] = set()
+    for asset_id, info in (state.get("used_still_fingerprints") or {}).items():
+        try:
+            last = datetime.fromisoformat(str(info.get("last_used") or ""))
+        except Exception:
+            out.add(str(asset_id))
+            continue
+        if (now - last).total_seconds() < cooldown_hours * 3600:
+            out.add(str(asset_id))
+    return out
+
+
+def filter_pool_by_prior_fingerprints(
+    pool: list, *, ban_max: int = 10, cooldown_hours: int = 24
+) -> list:
+    """Drop stills near prior upload keyframes OR inside used_still cooldown."""
+    import imagehash as _ih
+    from PIL import Image as _PilImg
+
+    state = _load_pipeline_state()
+    cooldown_ids = get_blacklisted_stills(state, cooldown_hours=cooldown_hours)
+    prior_hex: list[tuple[str, str]] = []
+    hist = list(state.get("upload_history") or [])
+    # Last 2 uploads only for still bans (full history still used at YouTube dedup).
+    for it in hist[-2:]:
+        title = str(it.get("title") or "prior")
+        for ph in ((it.get("fingerprint") or {}).get("phash_list") or []):
+            prior_hex.append((title, str(ph)))
+    kept: list = []
+    banned_cd = banned_ph = 0
+    for a in pool:
+        aid = str(getattr(a, "asset_id", "") or "")
+        p = Path(getattr(a, "path", a))
+        if aid and aid in cooldown_ids:
+            banned_cd += 1
+            print(f"[assemble] STILL_COOLDOWN_BAN {aid}", flush=True)
+            continue
+        if p.suffix.lower() in {".jpg", ".jpeg", ".png", ".webp"} and prior_hex:
+            try:
+                hx = str(_ih.phash(_PilImg.open(p)))
+                best, who = 999, ""
+                for title, hph in prior_hex:
+                    d = int(_ih.hex_to_hash(hx) - _ih.hex_to_hash(hph))
+                    if d < best:
+                        best, who = d, title
+                if best <= ban_max:
+                    banned_ph += 1
+                    print(
+                        f"[assemble] PRIOR_PHASH_BAN {p.name} min_dist={best} "
+                        f"vs {who[:48]!r} (limit<={ban_max})",
+                        flush=True,
+                    )
+                    continue
+            except Exception:
+                pass
+        kept.append(a)
+    n0 = len(pool)
+    # Exhaustion: may re-open COOLDOWN ids only — never PRIOR_PHASH_BAN clones.
+    if len(kept) < max(4, int(n0 * 0.3)):
+        print(
+            f"[assemble] WARNING: Still pool exhaustion ({len(kept)}/{n0}). "
+            f"Reopening cooldown only (prior_phash stays banned).",
+            flush=True,
+        )
+        kept2 = []
+        for a in pool:
+            p = Path(getattr(a, "path", a))
+            # skip if would be prior_phash banned
+            if p.suffix.lower() in {".jpg", ".jpeg", ".png", ".webp"} and prior_hex:
+                try:
+                    hx = str(_ih.phash(_PilImg.open(p)))
+                    best = min(int(_ih.hex_to_hash(hx) - _ih.hex_to_hash(hph)) for _, hph in prior_hex)
+                    if best <= ban_max:
+                        continue
+                except Exception:
+                    pass
+            kept2.append(a)
+        if len(kept2) >= 4:
+            kept = kept2
+        else:
+            print(
+                f"[assemble] CRITICAL thin unique stills={len(kept2)}; keeping prior-safe {len(kept)}",
+                flush=True,
+            )
+    if banned_cd or banned_ph:
+        print(
+            f"[assemble] still blacklist removed cooldown={banned_cd} prior_phash={banned_ph}; "
+            f"pool {n0}->{len(kept)}",
+            flush=True,
+        )
+    return kept
+
+
+
+def prior_phash_too_close(path: Path, *, limit: int = 8) -> tuple[bool, int, str]:
+    """True if image/video midframe is within `limit` of any upload_history keyframe."""
+    import imagehash as _ih
+    from PIL import Image as _PilImg
+    import subprocess
+    import tempfile
+
+    state = _load_pipeline_state()
+    prior = []
+    hist = list(state.get("upload_history") or [])
+    for it in hist[-2:]:
+        title = str(it.get("title") or "prior")
+        for ph in ((it.get("fingerprint") or {}).get("phash_list") or []):
+            prior.append((title, str(ph)))
+    if not prior:
+        return False, 999, ""
+    p = Path(path)
+    try:
+        if p.suffix.lower() in {".jpg", ".jpeg", ".png", ".webp"}:
+            hx = str(_ih.phash(_PilImg.open(p)))
+        elif p.suffix.lower() in {".mp4", ".mov", ".mkv", ".webm"}:
+            tmp = Path(tempfile.gettempdir()) / f"_prior_gate_{p.stem}.jpg"
+            subprocess.check_call(
+                ["ffmpeg", "-y", "-ss", "0.4", "-i", str(p), "-frames:v", "1", "-q:v", "4", str(tmp)],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+            hx = str(_ih.phash(_PilImg.open(tmp)))
+            try:
+                tmp.unlink(missing_ok=True)
+            except Exception:
+                pass
+        else:
+            return False, 999, ""
+        best, who = 999, ""
+        for title, hph in prior:
+            d = int(_ih.hex_to_hash(hx) - _ih.hex_to_hash(hph))
+            if d < best:
+                best, who = d, title
+        return (best <= limit), best, who
+    except Exception:
+        return False, 999, ""
+
+def record_used_stills(timeline: list, *, video_ref: str = "assembled") -> None:
+    """Persist fallback stills from timeline into used_still_fingerprints."""
+    from datetime import datetime
+    import imagehash as _ih
+    from PIL import Image as _PilImg
+
+    state = _load_pipeline_state()
+    bucket = state.setdefault("used_still_fingerprints", {})
+    now = datetime.now().isoformat(timespec="seconds")
+    n = 0
+    for clip in timeline:
+        aid = str(getattr(clip, "asset_id", "") or "")
+        if not aid or aid.startswith("ltx"):
+            continue
+        if not bool(getattr(clip, "is_fallback", False)):
+            continue
+        p = Path(getattr(clip, "path"))
+        ph = ""
+        try:
+            if p.suffix.lower() in {".jpg", ".jpeg", ".png", ".webp"}:
+                ph = str(_ih.phash(_PilImg.open(p)))
+        except Exception:
+            ph = ""
+        entry = bucket.get(aid) or {"phash": ph, "last_used": now, "used_in": []}
+        entry["last_used"] = now
+        if ph:
+            entry["phash"] = ph
+        used_in = list(entry.get("used_in") or [])
+        if video_ref not in used_in:
+            used_in.append(video_ref)
+        entry["used_in"] = used_in[-12:]
+        bucket[aid] = entry
+        n += 1
+    if n:
+        _save_pipeline_state(state)
+        print(f"[assemble] recorded {n} used stills into used_still_fingerprints", flush=True)
+
+
 
 @dataclass
 class ShotCandidate:
@@ -92,23 +289,15 @@ class AssembleResult:
 
 
 def _ffmpeg() -> str:
-    """Resolve ffmpeg via LTX_FFMPEG, PATH, then common locations."""
-    import os, shutil
-    env = os.environ.get("LTX_FFMPEG", "").strip()
-    if env and Path(env).exists():
-        return env
-    which = shutil.which("ffmpeg")
-    if which:
-        return which
-    for p in (
-        Path(r"C:\Program Files\ffmpeg\bin\ffmpeg.exe"),
-        Path(r"C:\ffmpeg\bin\ffmpeg.exe"),
-        Path("/usr/bin/ffmpeg"),
-        Path("/usr/local/bin/ffmpeg"),
-    ):
+    candidates = [
+        Path(r"C:\Users\yevhe\AppData\Local\Microsoft\WinGet\Links\ffmpeg.exe"),
+        Path(r"D:\ComfyUI\ComfyUI_windows_portable\python_embeded\Scripts\ffmpeg.exe"),
+    ]
+    for p in candidates:
         if p.exists():
             return str(p)
     return "ffmpeg"
+
 
 def load_assembler_config(path: Path | None = None) -> dict[str, Any]:
     cfg_path = path or (ROOT / "config" / "video_assembler.yaml")
@@ -373,7 +562,8 @@ def load_fallback_pool(pool_dir: Path | None = None) -> list[ShotCandidate]:
                 )
                 return None
         except Exception as _dark_exc:
-            print(f"[assemble] warning: negative_gate skip {asset_id} ({_dark_exc})", flush=True)
+            print(f"[assemble] warning: negative_gate FAIL-CLOSED reject {asset_id} ({_dark_exc})", flush=True)
+            return None
         # Explicit Laplacian structure insurance (grain fools mean luma)
         if laplacian_variance is not None:
             try:
@@ -386,14 +576,21 @@ def load_fallback_pool(pool_dir: Path | None = None) -> list[ShotCandidate]:
                     return None
             except Exception as _lap_exc:
                 print(f"[assemble] warning: laplacian skip {asset_id} ({_lap_exc})", flush=True)
-        # OCR text-area gate only (keycap glyphs must NOT gibber-fail macros)
+        # OCR text-area gate (screen/monitor/code => 1.5% limit)
         try:
             from shot_gate import passes_ocr_gate
-            _ok, _reason, _sc = passes_ocr_gate(p)
+            _cat = " ".join(
+                [
+                    str(asset_id or ""),
+                    str(explicit_primary or ""),
+                    " ".join(tags or []),
+                ]
+            )
+            _ok, _reason, _sc = passes_ocr_gate(p, shot_category=_cat)
             if not _ok:
                 print(
                     f"[assemble] warning: reject OCR-area pool asset {asset_id} reasons={_reason} "
-                    f"ratio={_sc.get('ocr_text_area_ratio', 0):.4f}",
+                    f"ratio={_sc.get('ocr_text_area_ratio', 0):.4f} lim={_sc.get('ocr_max_ratio_used', 0):.3f}",
                     flush=True,
                 )
                 return None
@@ -633,6 +830,30 @@ def assemble_timeline(
     work.mkdir(parents=True, exist_ok=True)
 
     pool = load_fallback_pool(ROOT / str(cfg.get("fallback_pool", {}).get("dir", "fallback_pool")))
+    # Anti-Loop v3.1: asset blacklist + visual template rotation, then shuffle
+    try:
+        import json as _al_json
+        import random as _al_random
+        import anti_loop as _anti_loop
+        from pathlib import Path as _AlPath
+        _al_state = _anti_loop.load_state()
+        pool = _anti_loop.fresh_asset_filter(pool, _al_state)
+        _cfg_path = _AlPath(__file__).resolve().parent / "config.json"
+        try:
+            _cfg = _al_json.loads(_cfg_path.read_text(encoding="utf-8")) if _cfg_path.exists() else {}
+        except Exception:
+            _cfg = {}
+        _template = _anti_loop.get_next_template(_al_state, _cfg.get("visual_templates"))
+        pool = _anti_loop.filter_pool_by_template(pool, _template, _al_state)
+        try:
+            pool = filter_pool_by_prior_fingerprints(pool, ban_max=10, cooldown_hours=24)
+        except Exception as _bl_exc:
+            print(f"[assemble] still blacklist skipped ({_bl_exc})", flush=True)
+        _al_random.shuffle(pool)
+        print(f"[assemble] Using visual template: {_template.get('name')}", flush=True)
+        print(f"[assemble] anti_loop pool ready n={len(pool)}", flush=True)
+    except Exception as _al_exc:
+        print(f"[assemble] anti_loop filter skipped ({_al_exc})", flush=True)
     # Stricter phash for small fallback pools
     if len(pool) <= 15:
         phash_max = max(int(cfg.get("phash_near_dup_max", PHASH_NEAR_DUP_MAX)), 55)
@@ -641,10 +862,24 @@ def assemble_timeline(
     reuse_gap = float(cfg.get("reuse_min_gap_sec", REUSE_MIN_GAP_SEC))
     min_pool = int(cfg.get("fallback_pool", {}).get("min_items_required", 8))
     if len(pool) < min_pool:
-        reason = (
-            f"fallback_pool has {len(pool)} items < min_items_required={min_pool}"
+        raw_pool = load_fallback_pool(ROOT / str(cfg.get("fallback_pool", {}).get("dir", "fallback_pool")))
+        print(
+            f"[assemble] WARNING: anti_loop left {len(pool)}<{min_pool}; "
+            f"refilling from raw pool n={len(raw_pool)} (asset blacklist still preferred via order)",
+            flush=True,
         )
-        return _fail(reason, audio_duration, soft_fail=soft_fail, strict=strict)
+        # Prefer previously filtered order, then append missing raw items
+        seen = {getattr(x, "asset_id", id(x)) for x in pool}
+        for c in raw_pool:
+            aid = getattr(c, "asset_id", None)
+            if aid not in seen:
+                pool.append(c)
+                seen.add(aid)
+        if len(pool) < min_pool:
+            reason = (
+                f"fallback_pool has {len(pool)} items < min_items_required={min_pool}"
+            )
+            return _fail(reason, audio_duration, soft_fail=soft_fail, strict=strict)
 
     # Normalize approved
     approved_raw: list[ShotCandidate] = []
@@ -698,12 +933,27 @@ def assemble_timeline(
                 ok, reason, scn = _neg_gate(probe, asset_id=a.asset_id, tags=list(a.tags or []))
                 a.mean_luma = float(scn.get("avg_luma", scn.get("mean_luma", 0.0)) or 0.0)
                 if not ok:
-                    print(
-                        f"[assemble] NEG_GATE drop approved {a.asset_id} reason={reason} "
-                        f"avg_luma={a.mean_luma:.1f} -> will use pool still",
-                        flush=True,
+                    # Gate-approved LTX must not be silently desk-replaced for theme/luma desk policy.
+                    aid = str(a.asset_id or "")
+                    is_ltx = aid.startswith("ltx") or (not bool(getattr(a, "is_fallback", True)))
+                    soft_miss = (
+                        str(reason).startswith("theme:")
+                        or str(reason).startswith("neg:avg_luma")
+                        or "avg_luma" in str(reason)
                     )
-                    continue
+                    if is_ltx and soft_miss and "yolo:person" not in str(reason) and "person" not in str(reason).lower():
+                        print(
+                            f"[assemble] NEG_GATE soft-keep approved {a.asset_id} reason={reason} "
+                            f"avg_luma={a.mean_luma:.1f} (topic LTX exempt from desk luma/theme)",
+                            flush=True,
+                        )
+                    else:
+                        print(
+                            f"[assemble] NEG_GATE drop approved {a.asset_id} reason={reason} "
+                            f"avg_luma={a.mean_luma:.1f} -> will use pool still",
+                            flush=True,
+                        )
+                        continue
             except Exception as exc:
                 print(f"[assemble] warning: neg_gate approved skip {a.asset_id} ({exc})", flush=True)
             finally:
@@ -809,6 +1059,14 @@ def assemble_timeline(
                 return False
             if prev_phash is not None and _phash_hamming(prev_phash, fb_hash) <= phash_max:
                 return False
+            near, dist, who = prior_phash_too_close(fb.path, limit=10)
+            if near:
+                print(
+                    f"[assemble] skip still {fb.asset_id} PRIOR_PHASH_NEAR min_dist={dist} "
+                    f"vs {who[:40]!r}",
+                    flush=True,
+                )
+                return False
             return True
 
         base = [fb for fb in available if _eligible(fb)]
@@ -835,18 +1093,28 @@ def assemble_timeline(
                 if preferred:
                     valid = preferred
 
-        # 2) If empty, fall back; prefer oldest group in recent_groups first
+        # 2) If empty, recover — but NEVER same super_category as the immediate previous clip
         if not valid:
             print(
-                f"[assemble] slidewin: no exclusion_group outside window={list(recent_groups)} - recover preferring oldest",
+                f"[assemble] slidewin: no exclusion_group outside window={list(recent_groups)} - recover avoiding last={last_exclusion}",
                 flush=True,
             )
-            oldest = recent_groups[0] if recent_groups else None
-            if oldest is not None:
-                prefer = [fb for fb in base if _egroup(fb) == oldest]
-                rest = [fb for fb in base if _egroup(fb) != oldest]
-                valid = prefer + rest
+            not_last = [fb for fb in base if _egroup(fb) != last_exclusion] if last_exclusion else list(base)
+            if not_last:
+                # Prefer groups underused in the recent window among not_last
+                oldest = recent_groups[0] if recent_groups else None
+                if oldest is not None and oldest != last_exclusion:
+                    prefer = [fb for fb in not_last if _egroup(fb) == oldest]
+                    rest = [fb for fb in not_last if _egroup(fb) != oldest]
+                    valid = prefer + rest if prefer else not_last
+                else:
+                    valid = not_last
             else:
+                # True pool exhaustion: only last_exclusion left — allow, audit may soft-warn
+                print(
+                    f"[assemble] slidewin: WARNING pool only has last={last_exclusion}; diversity exhausted",
+                    flush=True,
+                )
                 valid = list(base)
 
         # 3) pick best semantic match among valid; break ties toward underused super_category
@@ -857,6 +1125,7 @@ def assemble_timeline(
         best: ShotCandidate | None = None
         best_sem = -1.0
         best_key = None
+        scored: list[tuple[float, float, ShotCandidate]] = []
         for fb in valid:
             sem = semantic_score(beat_text, fb.tags, "")
             # slight bonus for preferred groups after device_macro
@@ -867,14 +1136,24 @@ def assemble_timeline(
             score = sem + bonus + underuse
             if sem < min_sem:
                 continue
+            scored.append((score, -float(used_sc.get(scg, 0)), fb))
             key = (score, -used_sc.get(scg, 0), fb.asset_id)
             if best is None or key > best_key:
                 best_sem = score
                 best = fb
                 best_key = key
+        # Anti-Loop: among near-equal top scores, break ties randomly (not always index 0)
+        if scored:
+            import random as _tie_random
+            top = max(s[0] for s in scored)
+            near = [c for (sc, _u, c) in scored if sc >= top - 0.02]
+            if near:
+                best = _tie_random.choice(near)
+                best_sem = next(sc for (sc, _u, c) in scored if c is best)
         if best is None and valid:
             # last resort: ignore soft semantic floor (still QC tags)
-            best = valid[0]
+            import random as _tie_random2
+            best = _tie_random2.choice(valid)
             best_sem = semantic_score(beat_text, best.tags, "")
         if best is None:
             return None
@@ -949,81 +1228,202 @@ def assemble_timeline(
 
         candidate: ShotCandidate | None = None
 
-        # INTERLEAVE: ~30% LTX (1 per ~3-4 stills); fail any gate -> still same super_category
-        prefer_ltx = (len(timeline) % 4 == 0) or (not full_pool)
+        # INTERLEAVE by DURATION quota (~30% LTX); fail any gate -> still (fail-closed)
+        hybrid_cfg = cfg.get("hybrid") if isinstance(cfg.get("hybrid"), dict) else {}
+        ltx_cfg = cfg.get("ltx") if isinstance(cfg.get("ltx"), dict) else {}
+        gates_cfg = cfg.get("gates") if isinstance(cfg.get("gates"), dict) else {}
+        target_ltx_ratio = float(hybrid_cfg.get("ltx_ratio", 0.30) or 0.30)
+        min_ltx_warn = float(hybrid_cfg.get("min_ltx_ratio_warn", 0.15) or 0.15)
+        min_ltx_motion = float(
+            gates_cfg.get("min_ltx_motion_score")
+            or ltx_cfg.get("min_motion_score")
+            or 1.8
+        )
+        ltx_covered = float(sum(float(c.hold_sec or 0.0) for c in timeline if not c.is_fallback))
+        need_ltx = (ltx_covered < (audio_duration * target_ltx_ratio) - 1e-6) or (not full_pool)
         unused_ltx = [
             a for a in approved_n
             if (not a.is_fallback) and a.asset_id not in used_ids and a.asset_id != prev_id and a.path.exists()
         ]
+        # Prefer liveliest LTX first
+        unused_ltx.sort(key=lambda x: float(x.motion_score or 0.0), reverse=True)
+        if len(unused_ltx) > 1:
+            import random as _ltx_rand
+            top_m = float(unused_ltx[0].motion_score or 0.0)
+            near_ltx = [x for x in unused_ltx if float(x.motion_score or 0.0) >= top_m - 0.15]
+            if near_ltx:
+                # shuffle near-equals so we don't always take index 0
+                _ltx_rand.shuffle(near_ltx)
+                rest = [x for x in unused_ltx if x not in near_ltx]
+                unused_ltx = near_ltx + rest
 
+        # Insert approved LTX before desk stills, but NEVER back-to-back
+        # (contig_hold on same primary_tag + slidewin on ltx_generated).
+        last_was_ltx = bool(timeline) and (not bool(getattr(timeline[-1], "is_fallback", True)))
+        prefer_ltx = bool(unused_ltx) and (not last_was_ltx)
+        if last_was_ltx and unused_ltx:
+            print(
+                f"[assemble] LTX_INTERLEAVE skip prefer (last={timeline[-1].asset_id}); "
+                f"unused_ltx={[x.asset_id for x in unused_ltx[:4]]}",
+                flush=True,
+            )
         if prefer_ltx and unused_ltx:
-            a = unused_ltx[0]
-            a_pt = _ptag(a) if a.primary_tag or a.tags else "monitor_code"
-            a_eg = _egroup(a) if (a.exclusion_group or a.primary_tag or a.tags) else "screen"
-            a_hash = _still_phash(a.path)
-            # Runtime LTX gate: YOLO person/face@0.15 + CLIP>=0.22 + luma<=100 + OCR<=5% + motion
-            ltx_reject = False
-            try:
-                from shot_gate import (
-                    passes_negative_gate, passes_ocr_gate, gate_ocr, extract_keyframes, gate_motion,
-                )
-                kf_dir = work / f"_ltx_gate_{a.asset_id}"
-                is_vid = a.path.suffix.lower() in {".mp4", ".mov", ".mkv", ".webm"}
-                kfs = extract_keyframes(a.path, kf_dir, count=3) if is_vid else [a.path]
-                probe = kfs[len(kfs)//2] if kfs else a.path
-                ok_n, reason_n, sc_n = passes_negative_gate(probe, asset_id=a.asset_id, tags=list(a.tags or []))
-                ok_area, reason_area, sc_area = passes_ocr_gate(probe)
-                ok_o, reason_o, sc_o = gate_ocr(kfs) if kfs else (True, "", {})
-                ok_mot, reason_mot, sc_mot = (True, "", {})
-                if is_vid:
-                    ok_mot, reason_mot, sc_mot = gate_motion(a.path)
-                # also reject near-static from candidate score
-                mot_score = float(a.motion_score or sc_mot.get("motion", 0.0) or 0.0)
-                if (not ok_mot) or (mot_score > 0 and mot_score < 1.8 and is_vid):
-                    ok_mot = False
-                    reason_mot = reason_mot or "motion:almost_static"
-                if (not ok_n) or (not ok_area) or (not ok_o and ("gibber" in str(reason_o).lower() or "scribbl" in str(reason_o).lower())) or (not ok_mot):
+            for a in list(unused_ltx):
+                if candidate is not None:
+                    break
+                # Unique primary_tag per LTX asset so contig_hold does not chain kb/topic clips.
+                a_pt = f"ltx_{a.asset_id}"
+                a_eg = _egroup(a) if (a.exclusion_group or a.primary_tag or a.tags) else "ltx_generated"
+                a_hash = _still_phash(a.path)
+                # Runtime LTX gate: YOLO fail-closed + CLIP + luma + category OCR + motion
+                ltx_reject = False
+                try:
+                    from shot_gate import (
+                        passes_negative_gate, passes_ocr_gate, gate_ocr, extract_keyframes, gate_motion,
+                    )
+                    kf_dir = work / f"_ltx_gate_{a.asset_id}"
+                    is_vid = a.path.suffix.lower() in {".mp4", ".mov", ".mkv", ".webm"}
+                    kfs = extract_keyframes(a.path, kf_dir, count=3) if is_vid else [a.path]
+                    probe = kfs[len(kfs)//2] if kfs else a.path
+                    ok_n, reason_n, sc_n = passes_negative_gate(probe, asset_id=a.asset_id, tags=list(a.tags or []))
+                    cat_blob = " ".join([a_pt, a_eg, " ".join(a.tags or [])])
+                    ok_area, reason_area, sc_area = passes_ocr_gate(
+                        probe, shot_category=cat_blob, fail_closed_if_missing=True
+                    )
+                    ok_o, reason_o, sc_o = gate_ocr(kfs) if kfs else (True, "", {})
+                    ok_mot, reason_mot, sc_mot = (True, "", {})
+                    if is_vid:
+                        ok_mot, reason_mot, sc_mot = gate_motion(a.path)
+                    # also reject near-static / frozen LTX
+                    mot_score = float(a.motion_score or sc_mot.get("motion", 0.0) or 0.0)
+                    if (not ok_mot) or (is_vid and mot_score < float(min_ltx_motion)):
+                        ok_mot = False
+                        reason_mot = reason_mot or f"motion:below_min:{mot_score:.3f}<{float(min_ltx_motion):.3f}"
+                    # Theme/luma desk-policy miss must not desk-replace gate-approved topic LTX.
+                    soft_n = (
+                        (not ok_n)
+                        and (
+                            str(reason_n).startswith("theme:")
+                            or str(reason_n).startswith("neg:avg_luma")
+                            or "avg_luma" in str(reason_n)
+                        )
+                        and ("yolo:person" not in str(reason_n))
+                        and ("person" not in str(reason_n).lower() or "avg_luma" in str(reason_n))
+                        and ok_area
+                        and (ok_o or not ("gibber" in str(reason_o).lower() or "scribbl" in str(reason_o).lower()))
+                    )
+                    if soft_n:
+                        print(
+                            f"[assemble] LTX_THEME_SOFT_KEEP {a.asset_id} reason={reason_n} "
+                            f"(runtime exempt; will LTX_IN_TIMELINE)",
+                            flush=True,
+                        )
+                        ok_n = True
+                    # Approved LTX with only slow motion: keep (KenBurns already applied for ltx_kb_*)
+                    if (
+                        (not ok_mot)
+                        and ok_area
+                        and (
+                            str(reason_mot).startswith("motion:almost_static")
+                            or "below_min" in str(reason_mot)
+                        )
+                        and (ok_n or soft_n)
+                        and (ok_o or not ("gibber" in str(reason_o).lower() or "scribbl" in str(reason_o).lower()))
+                    ):
+                        print(
+                            f"[assemble] LTX_MOTION_SOFT_KEEP {a.asset_id} reason={reason_mot} "
+                            f"motion={mot_score:.2f} (keep approved LTX vs desk-pool)",
+                            flush=True,
+                        )
+                        ok_mot = True
+                    # KenBurns salvage of OCR/static LTX often re-triggers OCR at runtime —
+                    # keep topic LTX over desk-pool clones (person/horror still hard-reject).
+                    _ocr_soft = (
+                        (
+                            (not ok_area)
+                            or (
+                                not ok_o
+                                and (
+                                    "gibber" in str(reason_o).lower()
+                                    or "scribbl" in str(reason_o).lower()
+                                    or "text_area" in str(reason_o).lower()
+                                    or "text_area" in str(reason_area).lower()
+                                )
+                            )
+                        )
+                        and ("yolo:person" not in str(reason_n).lower())
+                        and ("horror" not in str(reason_n).lower())
+                        and (
+                            ok_n
+                            or soft_n
+                            or str(reason_n).startswith("theme:")
+                            or "avg_luma" in str(reason_n)
+                        )
+                    )
+                    if _ocr_soft:
+                        print(
+                            f"[assemble] LTX_OCR_SOFT_KEEP {a.asset_id} "
+                            f"area={reason_area or ok_area} ocr={reason_o or ok_o} "
+                            f"(approved LTX vs desk-pool)",
+                            flush=True,
+                        )
+                        ok_area = True
+                        ok_o = True
+                        if soft_n or str(reason_n).startswith("theme:") or "avg_luma" in str(reason_n):
+                            ok_n = True
+                    if (not ok_n) or (not ok_area) or (not ok_o and ("gibber" in str(reason_o).lower() or "scribbl" in str(reason_o).lower())) or (not ok_mot):
+                        ltx_reject = True
+                        print(
+                            f"[assemble] LTX_REJECT_TO_POOL {a.asset_id} neg_ok={ok_n} ocr_area_ok={ok_area} "
+                            f"ocr_ok={ok_o} mot_ok={ok_mot} "
+                            f"reasons={[x for x in (reason_n, reason_area, reason_o, reason_mot) if x]} "
+                            f"avg_luma={sc_n.get('avg_luma',0):.1f} ocr_ratio={sc_area.get('ocr_text_area_ratio',0):.4f} "
+                            f"ocr_lim={sc_area.get('ocr_max_ratio_used',0):.3f} "
+                            f"motion={sc_mot.get('motion', mot_score):.2f}",
+                            flush=True,
+                        )
+                except Exception as _ltx_gate_exc:
+                    # FAIL-CLOSED: gate exception must not silently insert LTX
                     ltx_reject = True
+                    print(f"[assemble] LTX_REJECT_TO_POOL {a.asset_id} gate_exception={_ltx_gate_exc}", flush=True)
+                if ltx_reject:
+                    # burn this LTX id so we don't spin forever on the same reject
+                    used_ids.add(a.asset_id)
+                    continue
+                elif _phash_seen_anywhere(a_hash):
+                    print(f"[assemble] skip LTX near-dup phash anywhere {a.asset_id}", flush=True)
+                    continue
+                else:
+                    if a_eg in set(recent_groups):
+                        print(
+                            f"[assemble] LTX_EXCL_BYPASS {a.asset_id} exclusion_group={a_eg} "
+                            f"window={list(recent_groups)} (keep topic LTX over stills)",
+                            flush=True,
+                        )
+                    sem = semantic_score(beat_text, a.tags or ["workspace", "desk"], a.script_beat)
+                    if sem < min_sem and a.tags:
+                        print(
+                            f"[assemble] warning: approved {a.asset_id} semantic={sem:.2f} < {min_sem} - still using (gate-approved)",
+                            flush=True,
+                        )
+                    candidate = ShotCandidate(
+                        asset_id=a.asset_id,
+                        path=a.path,
+                        is_fallback=False,
+                        tags=list(a.tags or ["workspace"]),
+                        motion_score=float(a.motion_score or 0.0),
+                        script_beat=beat_text,
+                        hold_sec=hold,
+                        semantic_score=max(sem, 0.9),
+                        primary_tag=a_pt,
+                        subfamily=a.subfamily or a_pt,
+                        exclusion_group=a_eg,
+                    )
                     print(
-                        f"[assemble] LTX_REJECT_TO_POOL {a.asset_id} neg_ok={ok_n} ocr_area_ok={ok_area} "
-                        f"ocr_ok={ok_o} mot_ok={ok_mot} "
-                        f"reasons={[x for x in (reason_n, reason_area, reason_o, reason_mot) if x]} "
-                        f"avg_luma={sc_n.get('avg_luma',0):.1f} ocr_ratio={sc_area.get('ocr_text_area_ratio',0):.4f} "
-                        f"motion={sc_mot.get('motion', mot_score):.2f}",
+                        f"[assemble] LTX_IN_TIMELINE asset={a.asset_id} primary_tag={a_pt} exclusion_group={a_eg} hold={hold:.2f}s path={Path(a.path).name} "
+                        f"ltx_so_far={ltx_covered:.1f}s target={audio_duration * target_ltx_ratio:.1f}s",
                         flush=True,
                     )
-            except Exception as _ltx_gate_exc:
-                print(f"[assemble] warning: LTX insert gate skip ({_ltx_gate_exc})", flush=True)
-            if ltx_reject:
-                pass
-            elif a_eg in set(recent_groups):
-                print(f"[assemble] skip LTX {a.asset_id} exclusion_group={a_eg} in window {list(recent_groups)}", flush=True)
-            elif _phash_seen_anywhere(a_hash):
-                print(f"[assemble] skip LTX near-dup phash anywhere {a.asset_id}", flush=True)
-            else:
-                sem = semantic_score(beat_text, a.tags or ["workspace", "desk"], a.script_beat)
-                if sem < min_sem and a.tags:
-                    print(
-                        f"[assemble] warning: approved {a.asset_id} semantic={sem:.2f} < {min_sem} - still using (gate-approved)",
-                        flush=True,
-                    )
-                candidate = ShotCandidate(
-                    asset_id=a.asset_id,
-                    path=a.path,
-                    is_fallback=False,
-                    tags=list(a.tags or ["workspace"]),
-                    motion_score=float(a.motion_score or 0.0),
-                    script_beat=beat_text,
-                    hold_sec=hold,
-                    semantic_score=max(sem, 0.9),
-                    primary_tag=a_pt,
-                    subfamily=a.subfamily or a_pt,
-                    exclusion_group=a_eg,
-                )
-                print(
-                    f"[assemble] LTX_IN_TIMELINE asset={a.asset_id} primary_tag={a_pt} exclusion_group={a_eg} hold={hold:.2f}s path={Path(a.path).name}",
-                    flush=True,
-                )
 
         if candidate is None:
             candidate = _pick_pool_shot(beat_text)
@@ -1047,7 +1447,56 @@ def assemble_timeline(
                     exclusion_group=_egroup(a) if (a.exclusion_group or a.primary_tag or a.tags) else "screen",
                 )
 
-        if candidate is None:
+        if candidate is None and covered + 0.15 < audio_duration:
+            reuse_pick = None
+            try:
+                _refill_available()
+            except Exception:
+                pass
+            for fb in list(available):
+                if fb.asset_id == prev_id:
+                    continue
+                near, _, _ = prior_phash_too_close(Path(fb.path), limit=10)
+                if near:
+                    continue
+                reuse_pick = fb
+                break
+            if reuse_pick is None:
+                for fb in list(available):
+                    if fb.asset_id != prev_id:
+                        reuse_pick = fb
+                        print(
+                            f"[assemble] COVER_REUSE_LASTRESORT {fb.asset_id} "
+                            f"covered={covered:.1f}/{audio_duration:.1f}",
+                            flush=True,
+                        )
+                        break
+            if reuse_pick is not None:
+                hold = min(float(max_hold), max(0.8, audio_duration - covered))
+                candidate = ShotCandidate(
+                    asset_id=reuse_pick.asset_id,
+                    path=reuse_pick.path,
+                    is_fallback=True,
+                    tags=list(reuse_pick.tags or ["workspace"]),
+                    motion_score=float(reuse_pick.motion_score or 0.0),
+                    script_beat=beat_text,
+                    hold_sec=hold,
+                    semantic_score=0.5,
+                    primary_tag=getattr(reuse_pick, "primary_tag", "") or "",
+                    exclusion_group=getattr(reuse_pick, "exclusion_group", "") or "",
+                )
+                print(
+                    f"[assemble] COVER_REUSE {candidate.asset_id} hold={hold:.2f}s "
+                    f"covered={covered:.1f}->{covered + hold:.1f}/{audio_duration:.1f}",
+                    flush=True,
+                )
+            else:
+                print(
+                    f"[assemble] COVER_STALL covered={covered:.1f}/{audio_duration:.1f}",
+                    flush=True,
+                )
+                break
+        elif candidate is None:
             break
 
         # Cap approved video hold too (trim via ffmpeg if needed)
@@ -1098,6 +1547,35 @@ def assemble_timeline(
         asset_last_end[candidate.asset_id] = covered
         beat_i += 1
 
+    # Post-check LTX duration quota
+    try:
+        hybrid_cfg = cfg.get("hybrid") if isinstance(cfg.get("hybrid"), dict) else {}
+        target_ltx_ratio = float(hybrid_cfg.get("ltx_ratio", 0.30) or 0.30)
+        min_ltx_warn = float(hybrid_cfg.get("min_ltx_ratio_warn", 0.15) or 0.15)
+        ltx_secs = float(sum(float(c.hold_sec or 0.0) for c in timeline if not c.is_fallback))
+        still_secs = float(sum(float(c.hold_sec or 0.0) for c in timeline if c.is_fallback))
+        ratio = (ltx_secs / audio_duration) if audio_duration > 0 else 0.0
+        print(
+            f"[assemble] ltx_quota_audit ltx_secs={ltx_secs:.2f} still_secs={still_secs:.2f} "
+            f"ratio={ratio:.1%} target={target_ltx_ratio:.1%} warn_below={min_ltx_warn:.1%}",
+            flush=True,
+        )
+        if ratio < min_ltx_warn:
+            print(
+                f"[assemble] WARNING: LTX ratio is only {ratio:.1%}. Target was {target_ltx_ratio:.1%}. "
+                f"Check LTX generation prompts or gate rejection rates.",
+                flush=True,
+            )
+            # Desk-stills dominate → fingerprint clones priors; refuse mux/upload.
+            if ratio < float(min_ltx_warn) - 1e-9:
+                raise PipelineAbortError(
+                    f"ltx_ratio_too_low:{ratio:.3f}<{min_ltx_warn:.3f} (desk-pool clone risk)"
+                )
+    except PipelineAbortError:
+        raise
+    except Exception as _qexc:
+        print(f"[assemble] warning: ltx_quota_audit skipped ({_qexc})", flush=True)
+
     unique = len(used_ids)
     need_unique = max(1, math_ceil(audio_duration / dens))
     id_list = [c.asset_id for c in timeline]
@@ -1138,16 +1616,22 @@ def assemble_timeline(
         for c in timeline:
             probe = work / f"_lum_{c.asset_id}.jpg"
             try:
-                subprocess.check_call(
-                    [
-                        _ffmpeg(), "-y", "-ss", "0.3", "-i", str(c.path),
-                        "-frames:v", "1", "-q:v", "3", str(probe),
-                    ],
-                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-                )
-                # Near-black audit only (do not apply Laplacian here — KenBurns softens edges)
-                ok, lsc = still_luma_ok(probe, min_luma=MIN_STILL_LUMA, min_laplacian=0.0)
-                if not ok:
+                if Path(c.path).suffix.lower() in {".jpg", ".jpeg", ".png", ".webp", ".bmp"}:
+                    # Reused stills keep their source-image path. Probing an image with
+                    # "ffmpeg -ss 0.3" produces no frame, which used to be misread as a
+                    # near-black segment and aborted the whole build (false positive).
+                    # Measure the image itself instead.
+                    luma_ok, lsc = still_luma_ok(Path(c.path), min_luma=MIN_STILL_LUMA, min_laplacian=0.0)
+                else:
+                    subprocess.check_call(
+                        [
+                            _ffmpeg(), "-y", "-ss", "0.3", "-i", str(c.path),
+                            "-frames:v", "1", "-q:v", "3", str(probe),
+                        ],
+                        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                    )
+                    luma_ok, lsc = still_luma_ok(probe, min_luma=MIN_STILL_LUMA, min_laplacian=0.0)
+                if not luma_ok:
                     dark_secs += float(c.hold_sec or 0.0)
                     dark_hits.append(
                         f"{c.asset_id}:luma={lsc.get('luma', 0):.1f}/hold={float(c.hold_sec or 0):.2f}"
@@ -1260,9 +1744,13 @@ def assemble_timeline(
             flush=True,
         )
         if win_bad:
-            raise PipelineAbortError(
-                f"super_category repeated inside window of 2: {'; '.join(win_bad[:4])}"
-            )
+            has_ltx = any(not bool(getattr(c, "is_fallback", True)) for c in timeline)
+            msg = f"super_category repeated inside window of 2: {'; '.join(win_bad[:4])}"
+            if has_ltx:
+                # Keep unique LTX timeline instead of hard-aborting a near-done mux.
+                print(f"[assemble] WARNING soft slidewin: {msg}", flush=True)
+            else:
+                raise PipelineAbortError(msg)
 
         merged = []
         for seg in samples:
@@ -1271,7 +1759,11 @@ def assemble_timeline(
                 continue
             prev = merged[-1]
             ham = int(_np.count_nonzero(prev["bits"] != seg["bits"]))
-            same_primary = (prev.get("pt") or "") == (seg.get("primary_tag") or "") and bool(prev.get("pt"))
+            pt_a = str(prev.get("pt") or "")
+            pt_b = str(seg.get("primary_tag") or "")
+            # Each LTX clip gets unique ltx_<id> primary_tag; never contig-chain LTX with LTX.
+            both_ltx = pt_a.startswith("ltx_") and pt_b.startswith("ltx_")
+            same_primary = (pt_a == pt_b) and bool(pt_a) and (not both_ltx)
             # Contig wall-clock only chains same primary_tag (phash/geo tracked separately via slidewin)
             same = same_primary
             if same:
@@ -1336,6 +1828,38 @@ def assemble_timeline(
         covered_sec=covered,
         unique_assets=unique,
     )
+    # Anti-Loop: remember used asset_ids across scheduled runs
+    try:
+        import anti_loop as _anti_loop2
+        _ids = [c.asset_id for c in timeline if getattr(c, "asset_id", None)]
+        _anti_loop2.register_assets(_ids)
+        print(f"[assemble] anti_loop registered {len(set(_ids))} asset_ids", flush=True)
+    except Exception as _reg_exc:
+        print(f"[assemble] anti_loop register_assets skipped ({_reg_exc})", flush=True)
+    # Fail-closed: KenBurns/encode can drift a still toward a prior upload keyframe.
+    try:
+        bad_priors = []
+        for c in timeline:
+            if not bool(getattr(c, "is_fallback", False)):
+                continue
+            near, dist, who = prior_phash_too_close(Path(c.path), limit=6)
+            if near:
+                bad_priors.append(f"{c.asset_id}:min_dist={dist} vs {who[:32]!r}")
+        # A single still close to an old release is not proof of a duplicate.
+        if len(bad_priors) >= 2:
+            raise PipelineAbortError(
+                "still_prior_phash_after_kb:" + "; ".join(bad_priors[:4])
+            )
+        if bad_priors:
+            print(f"[assemble] prior_phash warning (single hit, kept): {bad_priors[0]}", flush=True)
+    except PipelineAbortError:
+        raise
+    except Exception as _pg_exc:
+        print(f"[assemble] prior_phash post-KB gate skipped ({_pg_exc})", flush=True)
+    try:
+        record_used_stills(timeline, video_ref="assembled")
+    except Exception as _rs_exc:
+        print(f"[assemble] record_used_stills skipped ({_rs_exc})", flush=True)
     return result
 
 
@@ -1369,6 +1893,29 @@ def _fail(
     )
 
 
+_VISUAL_GRADE = None
+
+
+def _grade_vf(base: str) -> str:
+    """Append this release's colour grade so consecutive releases look different.
+
+    Chosen once per process by visual_identity.current_identity() and recorded
+    in pipeline_state.json so the next release gets a different one.
+    """
+    global _VISUAL_GRADE
+    if _VISUAL_GRADE is None:
+        try:
+            import visual_identity as _vi
+            _VISUAL_GRADE = _vi.current_identity()
+            print(f"[assemble] visual identity: {_VISUAL_GRADE[0]}", flush=True)
+        except Exception as _vi_exc:
+            print(f"[assemble] visual identity skipped ({_vi_exc})", flush=True)
+            _VISUAL_GRADE = ("neutral", "")
+    _name, _flt = _VISUAL_GRADE
+    chain = base if not _flt else f"{base},{_flt}"
+    return chain + ",format=yuv420p"
+
+
 def _concat_videos(clips: list[Path], dest: Path, max_hold: float = MAX_STILL_HOLD_SEC) -> Path:
     """Normalize every clip to 1280x720@24 before concat.
 
@@ -1388,8 +1935,10 @@ def _concat_videos(clips: list[Path], dest: Path, max_hold: float = MAX_STILL_HO
                 _ffmpeg(), "-y", "-i", str(clip),
                 "-t", f"{cap:.3f}",
                 "-vf",
-                "scale=1280:720:force_original_aspect_ratio=decrease,"
-                "pad=1280:720:(ow-iw)/2:(oh-ih)/2:black,fps=24,format=yuv420p",
+                _grade_vf(
+                    "scale=1280:720:force_original_aspect_ratio=decrease,"
+                    "pad=1280:720:(ow-iw)/2:(oh-ih)/2:black,fps=24"
+                ),
                 "-c:v", "libx264", "-preset", "fast", "-crf", "18",
                 "-an", "-movflags", "+faststart", str(out),
             ],
