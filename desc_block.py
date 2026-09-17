@@ -9,6 +9,10 @@ channel + code links + an honest "how this video was made" note.
 """
 from __future__ import annotations
 
+import json
+import os
+from pathlib import Path
+
 CHANNEL_NAME = "YEVHEN POTAPOV"
 CHANNEL_HANDLE = "@yevhenpotapov5956"
 CHANNEL_URL = "https://www.youtube.com/@yevhenpotapov5956"
@@ -39,16 +43,59 @@ HOW_EN = (
 )
 
 
+
+# ── site link ───────────────────────────────────────────────────────────────
+PROJECTS_JSON = Path(r"C:\Users\yevhe\.openclaw-autoclaw\workspace\projects\projects.json")
+
+
+def site_url() -> str:
+    """Public address of the project site.
+
+    Manual override first, then whatever AutoClaw wrote into projects.json:
+    the stable address once the site is published, the preview one before that.
+    Returns "" when nothing is known yet — the line is then simply omitted.
+    """
+    env = os.environ.get("CONTENTFORGE_SITE_URL", "").strip()
+    if env:
+        return env
+    try:
+        import json as _json
+        data = _json.loads(PROJECTS_JSON.read_text(encoding="utf-8"))
+    except Exception:
+        return ""
+    if not isinstance(data, list):
+        return ""
+    for proj in data:
+        res = (proj or {}).get("deploymentResult") or {}
+        if not res:
+            continue
+        status = str(res.get("status") or "").lower()
+        stable = str(res.get("stableUrl") or "").strip()
+        preview = str(res.get("previewUrl") or "").strip()
+        if ("publish" in status or "stable" in status) and stable:
+            return stable
+        if preview:
+            return preview
+        if stable:
+            return stable
+    return ""
+
 def links_block(lang: str = "ru") -> str:
     label = "Код" if lang == "ru" else "Code"
-    return "\n".join([
+    site_label = "Сайт" if lang == "ru" else "Website"
+    rows = []
+    url = site_url()
+    if url:
+        rows += [f"{site_label}: {url}", ""]
+    rows += [
         f"{CHANNEL_NAME} {CHANNEL_HANDLE}",
         CHANNEL_URL,
         "",
         f"GitHub: {GITHUB_URL}",
         f"{label} / Gold Standard: {GOLD_URL}",
         f"ContentForge (multi-platform factory): {CONTENTFORGE_URL}",
-    ])
+    ]
+    return "\n".join(rows)
 
 
 def build_description(body: str = "", lang: str = "ru", extra: str = "") -> str:
