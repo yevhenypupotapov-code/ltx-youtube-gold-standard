@@ -3,7 +3,6 @@ from __future__ import annotations
 
 
 import argparse
-import os
 
 import subprocess
 
@@ -21,30 +20,35 @@ if str(ROOT) not in sys.path:
 
     sys.path.insert(0, str(ROOT))
 
-FACTORY = Path(os.environ.get("LTX_FACTORY", str(ROOT / "factory"))).expanduser()
-COMFY_PY = Path(os.environ.get("LTX_COMFY_PY", "python")).expanduser()
+FACTORY = Path(r"C:\Users\yevhe\.openclaw\workspace")
+
+COMFY_PY = Path(r"D:\ComfyUI\ComfyUI_windows_portable\python_embeded\python.exe")
 
 
 
 def find_ffmpeg() -> str:
-    """Resolve ffmpeg: LTX_FFMPEG env, then PATH, then common install locations."""
-    import shutil
-    env = os.environ.get("LTX_FFMPEG", "").strip()
-    if env and Path(env).exists():
-        return env
-    which = shutil.which("ffmpeg")
-    if which:
-        return which
+
     candidates = [
-        Path(r"C:\Program Files\ffmpeg\bin\ffmpeg.exe"),
-        Path(r"C:\ffmpeg\bin\ffmpeg.exe"),
-        Path("/usr/bin/ffmpeg"),
-        Path("/usr/local/bin/ffmpeg"),
+
+        r"C:\Users\yevhe\AppData\Local\Microsoft\WinGet\Links\ffmpeg.exe",
+
+        r"D:\ComfyUI\ComfyUI_windows_portable\python_embeded\Scripts\ffmpeg.exe",
+
+        r"C:\Program Files\ffmpeg\bin\ffmpeg.exe",
+
+        r"C:\ffmpeg\bin\ffmpeg.exe",
+
     ]
+
     for p in candidates:
-        if p.exists():
-            return str(p)
+
+        if Path(p).exists():
+
+            return p
+
     return "ffmpeg"
+
+
 
 FFMPEG = find_ffmpeg()
 
@@ -86,7 +90,7 @@ SAFETY_NEGATIVE = (
 
     "empty frame, black frame, morphing face, melted face, duplicate faces, twins, "
 
-"people, hands, faces, person, human, portrait, selfie, typing hands, "
+"people, hands, faces, person, human, humans, crowd, body, bodies, silhouette, portrait, selfie, typing hands, mannequin, statue face, close-up face, eye contact, skin pores, hair strands, clothing on person, "
     "bright, white, high-key, overexposed, bright office, white desk, daylight flood, "
     "ui, hud, dashboard chrome, "
         "green skin, wax face, mask straps, human face close-up, portrait, people faces"
@@ -102,13 +106,45 @@ DEFAULT_LONG_FRAMES = 81
 
 
 MOTION = [
-    "slow cinematic pan left over dark tech desk, visible camera drift, subtle parallax",
-    "slow cinematic pan right over dark tech desk, visible camera drift, subtle parallax",
-    "gentle camera push-in, subtle parallax, dark moody lighting",
-    "slow pull back revealing more of the dark desk, subtle parallax",
-    "slight orbit around the subject, cinematic, dark tech workspace",
-    "camera eases closer, slow cinematic motion, same dark scene",
+    "slow cinematic pan left, visible camera drift, subtle parallax",
+    "slow cinematic pan right, visible camera drift, subtle parallax",
+    "gentle camera push-in, subtle parallax, moody lighting",
+    "slow pull back revealing more of the subject, subtle parallax",
+    "slight orbit around the subject, cinematic lighting",
+    "camera eases closer, slow cinematic motion, consistent scene lighting",
 ]
+
+
+
+
+
+def find_ffmpeg() -> str:
+
+    candidates = [
+
+        r"C:\Users\yevhe\AppData\Local\Microsoft\WinGet\Links\ffmpeg.exe",
+
+        r"D:\ComfyUI\ComfyUI_windows_portable\python_embeded\Scripts\ffmpeg.exe",
+
+        r"C:\Program Files\ffmpeg\bin\ffmpeg.exe",
+
+        r"C:\ffmpeg\bin\ffmpeg.exe",
+
+    ]
+
+    for p in candidates:
+
+        if Path(p).exists():
+
+            return p
+
+    return "ffmpeg"
+
+
+
+
+
+FFMPEG = find_ffmpeg()
 
 
 
@@ -289,6 +325,7 @@ def generate_clip(
         "--prefix", prefix,
 
         "--frames", str(frames),
+        "--seed", str(__import__("random").randint(1, 2**31 - 1)),
 
     ]
 
@@ -337,6 +374,38 @@ def run_hybrid(args: argparse.Namespace) -> int:
 
 
     topic = vf.pick_topic(args.topic, args.lang)
+    # Anti-Loop: re-pick if too similar to recent history/state (up to 5)
+    try:
+        import anti_loop as _al_topic
+        _st = _al_topic.load_state()
+        _hist_titles = []
+        try:
+            for _row in (vf.load_history() or [])[-40:]:
+                if isinstance(_row, dict):
+                    for _k in ("title", "topic", "angle"):
+                        if _row.get(_k):
+                            _hist_titles.append(str(_row.get(_k)))
+        except Exception:
+            pass
+        for _item in (_st.get("last_topics") or [])[-40:]:
+            if isinstance(_item, dict):
+                _hist_titles.append(str(_item.get("title") or _item.get("norm") or ""))
+            else:
+                _hist_titles.append(str(_item))
+        for _attempt in range(5):
+            if not any(_al_topic.title_too_similar(topic, h) for h in _hist_titles if h):
+                break
+            print(f"[long] anti_loop title re-pick attempt={_attempt+1} was={topic[:70]}", flush=True)
+            topic = vf.pick_topic(None, args.lang)
+        else:
+            # last resort: dated unique suffix with seconds
+            from datetime import datetime as _dt
+            _stamp = _dt.now().strftime("%Y-%m-%d %H:%M:%S")
+            topic = f"AI angle {_stamp}"
+            print(f"[long] anti_loop dated suffix fallback: {topic}", flush=True)
+        _al_topic.register_topic(topic)
+    except Exception as _topic_exc:
+        print(f"[long] anti_loop topic gate skipped ({_topic_exc})", flush=True)
 
     content = vf.generate_ltx_plan(
 
@@ -434,9 +503,19 @@ def run_hybrid(args: argparse.Namespace) -> int:
 
     desc = content.get("description") or title
 
-    if CHANNEL_HANDLE not in desc:
+    try:
 
-        desc += f"\n\n{CHANNEL_HANDLE}\n{CHANNEL_URL}"
+        import desc_block as _db
+
+        desc = _db.build_description(desc or title, lang=getattr(args, "lang", "ru") or "ru")
+
+    except Exception as _db_exc:
+
+        print(f"[long] desc_block skipped ({_db_exc})", flush=True)
+
+        if CHANNEL_HANDLE not in desc:
+
+            desc += f"\n\n{CHANNEL_HANDLE}\n{CHANNEL_URL}"
 
     upload_video(
 
@@ -485,6 +564,38 @@ def _script_bundle(args: argparse.Namespace) -> tuple[str, str, str, dict]:
         import json as _json
 
         topic = vf.pick_topic(args.topic, args.lang)
+        # Anti-Loop: re-pick if too similar to recent history/state (up to 5)
+        try:
+            import anti_loop as _al_topic
+            _st = _al_topic.load_state()
+            _hist_titles = []
+            try:
+                for _row in (vf.load_history() or [])[-40:]:
+                    if isinstance(_row, dict):
+                        for _k in ("title", "topic", "angle"):
+                            if _row.get(_k):
+                                _hist_titles.append(str(_row.get(_k)))
+            except Exception:
+                pass
+            for _item in (_st.get("last_topics") or [])[-40:]:
+                if isinstance(_item, dict):
+                    _hist_titles.append(str(_item.get("title") or _item.get("norm") or ""))
+                else:
+                    _hist_titles.append(str(_item))
+            for _attempt in range(5):
+                if not any(_al_topic.title_too_similar(topic, h) for h in _hist_titles if h):
+                    break
+                print(f"[long] anti_loop title re-pick attempt={_attempt+1} was={topic[:70]}", flush=True)
+                topic = vf.pick_topic(None, args.lang)
+            else:
+                # last resort: dated unique suffix with seconds
+                from datetime import datetime as _dt
+                _stamp = _dt.now().strftime("%Y-%m-%d %H:%M:%S")
+                topic = f"AI angle {_stamp}"
+                print(f"[long] anti_loop dated suffix fallback: {topic}", flush=True)
+            _al_topic.register_topic(topic)
+        except Exception as _topic_exc:
+            print(f"[long] anti_loop topic gate skipped ({_topic_exc})", flush=True)
 
         n = max(8, int(getattr(args, "segments", None) or 10))
 
@@ -548,6 +659,17 @@ def run_long(args: argparse.Namespace) -> int:
 
     from yt import CHANNEL_HANDLE, CHANNEL_URL, upload_video
 
+
+    # Anti-Loop v3.1: unique run salt + archive stale fixed outputs before generate
+    import random as _al_random
+    import os as _al_os
+    _al_os.environ["LTX_RUN_SALT"] = str(_al_random.randint(1, 10**9))
+    try:
+        import anti_loop as _anti_loop
+        _anti_loop.archive_fixed_outputs(Path(r"D:\\Tutorial\\Output"))
+    except Exception as _arch_exc:
+        print(f"[long] anti_loop archive skipped ({_arch_exc})", flush=True)
+
     from add_audio import add_voiceover, tts_to_mp3, probe_duration, mux_fit
 
     from video_assembler import (
@@ -567,6 +689,28 @@ def run_long(args: argparse.Namespace) -> int:
 
 
     topic, title, script, content = _script_bundle(args)
+    # Keep VO within visual budget: ~5s holds need many unique stills; long scripts
+    # (400+ words / ~85s) outrun PRIOR_PHASH-thinned pools and cause mux pad abort.
+    _MAX_LONG_WORDS = 140
+    _words = str(script or "").split()
+    if len(_words) > _MAX_LONG_WORDS:
+        script = " ".join(_words[:_MAX_LONG_WORDS])
+        if isinstance(content, dict):
+            content = dict(content)
+            content["script"] = script
+            if "shots" in content and isinstance(content["shots"], list):
+                # keep shot count but trim narration fields if present
+                for _sh in content["shots"]:
+                    if isinstance(_sh, dict) and "narration" in _sh:
+                        _nw = str(_sh.get("narration") or "").split()
+                        if len(_nw) > 18:
+                            _sh["narration"] = " ".join(_nw[:18])
+        print(
+            f"[long] VO_TRIM words {len(_words)}->{_MAX_LONG_WORDS} "
+            f"(visual coverage budget)",
+            flush=True,
+        )
+
 
     shots = list(content.get("shots") or []) if isinstance(content, dict) else []
 
@@ -639,7 +783,7 @@ def run_long(args: argparse.Namespace) -> int:
     shot_sec = min(max(3.5, frames / 24.0), max_hold)
 
     # ~25-30% of beats get LTX attempts: 1 LTX per 3-4 stills (1-based)
-    ltx_slots = {i for i in range(1, n + 1) if (i % 4) == 1}  # e.g. [1,5,9] for n=10 (~30%)
+    ltx_slots = {i for i in range(1, n + 1) if (i % 2) == 1}  # e.g. [1,3,5,7] for n=8 (~50%) — break stills-pool clones
 
     print(
 
@@ -693,11 +837,11 @@ def run_long(args: argparse.Namespace) -> int:
 
         visual = (
 
-            f"{visual} Dark tech desk, moody cinematic lighting, objects and spaces only. "
+            f"{visual} Moody cinematic lighting, objects and spaces only — keep topic motifs. "
 
             "No people, no hands, no faces, no twins, no portraits, no readable text on screens, "
 
-            "no glyphs, no UI chrome, no fake code, blank or heavily blurred monitors only, "
+            "no glyphs, no UI chrome, no fake code, blank or heavily blurred monitors only when screens appear, "
 
             "solid soft glow screens OK, no logos, no subtitles, no bright white flood."
 
@@ -711,16 +855,17 @@ def run_long(args: argparse.Namespace) -> int:
 
             f"{prompt} {motion}. "
 
-            "Slow cinematic pan over dark tech desk, subtle parallax. "
-            "Monitors are blank soft glowing screens, out of focus, no UI, no text, no glyphs, "
+            "Strong continuous camera drift with visible parallax — not a still photo. "
+            "Absolutely no humans, no faces, no twins, no reflections of faces, no mannequins. "
+            "If monitors appear: blank soft glowing screens, out of focus, no UI, no text, no glyphs, "
 
-            "no icons, photoreal dark desk only, no near-black empty frames, no bright white."
+            "no icons; photoreal scene matching the topic motifs; no near-black empty frames, no bright white flood."
 
         )
 
-        if script_beat:
+        # Do NOT append spoken beat to t2v — people-words bias faces into LTX.
+        # (script_beat still used for gate semantic / stills.)
 
-            prompt = f"{prompt} Narration beat: {script_beat[:100]}"
 
 
 
@@ -735,36 +880,44 @@ def run_long(args: argparse.Namespace) -> int:
             # Up to 2 candidates per LTX slot when first is OCR/UI-rejected (cheap retry)
 
             accepted_ltx = False
+            # (score, keyframe_path, reasons) — salvage non-people rejects via KenBurns
+            best_salvage = None
 
-            for cand in (1, 2):
+            for cand in (1, 2, 3):
 
                 prefix = f"video/LTX_long_{i+1:02d}" + (f"_c{cand}" if cand > 1 else "")
 
                 try:
 
+                    # Cand>=2: forced empty-environment motif (topic wording biases faces).
+                    _env_pool = [
+                        "Empty rural community center room with stacked chairs, soft window light, no people",
+                        "Macro of blank paper forms and a closed laptop on a wood table, no hands",
+                        "Quiet server rack aisle with blinking LEDs, slow dolly, no humans",
+                        "Wide empty parking lot beside a low office building at dusk, no pedestrians",
+                        "Close-up of fiber optic cables coiled on a workbench, shallow depth of field",
+                        "Empty classroom desks with closed notebooks, soft daylight, no people",
+                    ]
+                    import hashlib as _hl
+                    _env = _env_pool[int(_hl.md5(f"{i}-{cand}-{beat_label}".encode()).hexdigest()[:8], 16) % len(_env_pool)]
                     cand_prompt = prompt
-
-                    if cand > 1:
-
+                    if cand == 2:
                         cand_prompt = (
-
-                            prompt + " Extreme soft focus on any screens, completely blank monitors, "
-
-                            "no marks, no patterns on displays."
-
+                            f"{_env}. Moody cinematic lighting, objects and spaces only. "
+                            "Extreme soft focus on any screens, completely blank monitors, "
+                            "no marks, no patterns on displays, no faces, no twins, no skin, no humans. "
+                            "Strong continuous camera drift with visible parallax — not a still photo."
+                        )
+                    elif cand == 3:
+                        cand_prompt = (
+                            f"{_env}. Aggressive slow orbit with large visible parallax, objects shift across frame, "
+                            "never a locked-off still, absolutely no faces, no twins, no people, no hands, "
+                            "blank unreadable screens only, photoreal empty environment."
                         )
 
-                    if last_img is not None and last_img.exists() and i % 2 == 1 and cand == 1:
+                    # Always t2v for LTX inserts — i2v from prior stills often injects faces/twins.
 
-                        clip = generate_clip(
-
-                            mode="i2v", prompt=cand_prompt, prefix=prefix, frames=frames, image=last_img
-
-                        )
-
-                    else:
-
-                        clip = generate_clip(mode="t2v", prompt=cand_prompt, prefix=prefix, frames=frames)
+                    clip = generate_clip(mode="t2v", prompt=cand_prompt, prefix=prefix, frames=frames)
 
                     gdir = gate_dir / f"shot_{i+1:02d}" / f"c{cand}"
 
@@ -822,7 +975,9 @@ def run_long(args: argparse.Namespace) -> int:
 
                                 is_fallback=False,
 
-                                tags=["workspace", "desk", "monitor_glow"],
+                                tags=["ltx", "topic", "generated", "ltx_topic"],
+                                primary_tag="ltx_topic",
+                                exclusion_group="ltx_generated",
 
                                 motion_score=float(result.scores.get("motion") or 0.0),
 
@@ -837,12 +992,31 @@ def run_long(args: argparse.Namespace) -> int:
                     else:
 
                         clip = None
+                        _reasons = [str(r) for r in (result.reasons or [])]
+                        _mot = float(result.scores.get("motion") or 0.0)
+                        _hard_people = any(
+                            r.startswith(("horror", "uncanny", "face", "people", "neg:yolo:person", "neg:yolo:face"))
+                            or "person" in r or "hands_or_face" in r or "twins" in r
+                            for r in _reasons
+                        )
+                        # Salvage: almost_static / bright_office / soft:* / OCR-only — not people/horror
+                        _salvageable = (not _hard_people) and bool(result.keyframe) and (
+                            all(
+                                r.startswith(("motion:", "soft:", "palette:bright", "palette:", "style:", "ocr:", "neg:avg_luma"))
+                                for r in _reasons
+                            )
+                            if _reasons else False
+                        )
+                        if _salvageable:
+                            _score = _mot + (0.5 if any(r.startswith("soft:") for r in _reasons) else 0.0)
+                            if best_salvage is None or _score > best_salvage[0]:
+                                best_salvage = (_score, Path(result.keyframe), _reasons)
 
-                        # Retry only when OCR/UI / style reject — skip 2nd try on hard uncanny/horror
+                        # Skip further cands only on horror/gore; uncanny/OCR/motion get retries
 
                         hard = any(
 
-                            str(r).startswith(("horror", "uncanny", "face", "tech:"))
+                            str(r).startswith(("horror", "tech:gore"))
 
                             for r in (result.reasons or [])
 
@@ -852,7 +1026,7 @@ def run_long(args: argparse.Namespace) -> int:
 
                             print(
 
-                                f"[gate] shot {i+1} LTX hard-reject {result.reasons} — no 2nd cand",
+                                f"[gate] shot {i+1} LTX hard-reject {result.reasons} - no more cands",
 
                                 flush=True,
 
@@ -860,11 +1034,11 @@ def run_long(args: argparse.Namespace) -> int:
 
                             break
 
-                        if cand == 1:
+                        if cand < 3:
 
                             print(
 
-                                f"[gate] shot {i+1} LTX rejected ({result.reasons}) — trying 2nd candidate",
+                                f"[gate] shot {i+1} LTX rejected ({result.reasons}) - trying cand {cand+1}",
 
                                 flush=True,
 
@@ -879,16 +1053,39 @@ def run_long(args: argparse.Namespace) -> int:
                     clip = None
 
             if not accepted_ltx:
-
-                clip = None
-
-                print(
-
-                    f"[gate] shot {i+1} LTX rejected -> assembler will use diversified fallback pool",
-
-                    flush=True,
-
-                )
+                # Salvage non-people LTX keyframes via KenBurns — beats desk-pool clones.
+                if best_salvage and best_salvage[1] is not None and Path(best_salvage[1]).exists():
+                    still = Path(best_salvage[1])
+                    clip = work / f"ltx_static_kb_{i+1:02d}.mp4"
+                    still_to_kenburns_clip(
+                        still, clip, seconds=min(shot_sec, max_hold), max_still_hold_sec=max_hold
+                    )
+                    accepted_kfs.append(still)
+                    src = "ltx_kb"
+                    accepted_ltx = True
+                    accepted.append(
+                        ShotCandidate(
+                            asset_id=f"ltx_kb_{i+1:02d}",
+                            path=clip,
+                            is_fallback=False,
+                            tags=["ltx", "kenburns", "topic", "ltx_salvage"],
+                            motion_score=max(1.2, float(best_salvage[0])),
+                            script_beat=script_beat or beat_label,
+                            primary_tag="ltx_salvage",
+                            exclusion_group="ltx_generated",
+                        )
+                    )
+                    print(
+                        f"[gate] shot {i+1} LTX salvage via KenBurns "
+                        f"score={best_salvage[0]:.2f} reasons={best_salvage[2]} still={still.name}",
+                        flush=True,
+                    )
+                else:
+                    clip = None
+                    print(
+                        f"[gate] shot {i+1} LTX rejected -> assembler will use diversified fallback pool",
+                        flush=True,
+                    )
 
 
 
@@ -1002,7 +1199,7 @@ def run_long(args: argparse.Namespace) -> int:
 
     # --- TTS early so assembler covers real audio duration ---
 
-    out_dir = Path(os.environ.get("LTX_OUTPUT_DIR", str(ROOT / "output"))).expanduser()
+    out_dir = Path(r"D:\\Tutorial\\Output")
 
     out_dir.mkdir(parents=True, exist_ok=True)
 
@@ -1053,10 +1250,21 @@ def run_long(args: argparse.Namespace) -> int:
         )
 
     if not approved_ltx:
-
-        print("[long] warning: zero LTX approved — timeline will be pool stills only", flush=True)
-
-
+        print(
+            "[long] CRITICAL: zero LTX approved — refusing desk-pool-only clone upload",
+            flush=True,
+        )
+        (assemble_dir / "quality_compromised.json").write_text(
+            _json.dumps(
+                {
+                    "quality_compromised": True,
+                    "reason": "zero_ltx_approved_stills_only",
+                },
+                indent=2,
+            ),
+            encoding="utf-8",
+        )
+        return 3
 
     stitched = out_dir / "LTX_long_concat.mp4"
 
@@ -1164,9 +1372,32 @@ def run_long(args: argparse.Namespace) -> int:
 
         desc = title
 
-    if CHANNEL_HANDLE not in desc:
+    try:
 
-        desc += f"\\n\\n{CHANNEL_HANDLE}\\n{CHANNEL_URL}"
+        import desc_block as _db
+
+        desc = _db.build_description(desc or title, lang=getattr(args, "lang", "ru") or "ru")
+
+    except Exception as _db_exc:
+
+        print(f"[long] desc_block skipped ({_db_exc})", flush=True)
+
+        if CHANNEL_HANDLE not in desc:
+
+            desc += f"\n\n{CHANNEL_HANDLE}\n{CHANNEL_URL}"
+
+    # Anti-Loop: abort if output bytes already in upload_history (pre-yt belt)
+    try:
+        import anti_loop as _al_hash
+        _fh = _al_hash.file_md5(video)
+        if _al_hash.hash_in_upload_history(_fh):
+            raise SystemExit(
+                f"ABORT DUPLICATE FILE: md5={_fh} already in pipeline_state upload_history"
+            )
+    except SystemExit:
+        raise
+    except Exception as _h_exc:
+        print(f"[long] anti_loop hash precheck skipped ({_h_exc})", flush=True)
 
     upload_video(
 
@@ -1194,7 +1425,7 @@ def run_long(args: argparse.Namespace) -> int:
 
 def main() -> int:
 
-    p = argparse.ArgumentParser(description="LTX YouTube factory: slides / LTX / hybrid / long")
+    p = argparse.ArgumentParser(description="YEVHEN factory: slides / LTX / hybrid / long")
 
     p.add_argument("--engine", choices=["slides", "ltx", "hybrid", "long"], default="hybrid")
 
@@ -1206,7 +1437,7 @@ def main() -> int:
 
     p.add_argument("--minutes", type=int, default=6)
 
-    p.add_argument("--model", default="ltx-factory:latest")
+    p.add_argument("--model", default="ornith-1.5:9b")
 
     p.add_argument("--mode", choices=["t2v", "i2v"], default="t2v")
 
