@@ -1,4 +1,6 @@
 # -*- coding: utf-8 -*-
+# Copyright (c) 2026 Yevhen Potapov. All rights reserved.
+# Part of ContentForge. See LICENSE in the repository root.
 """
 still_farm.py -- grow the LTX fallback pool with freshly generated stills.
 
