@@ -1,4 +1,6 @@
 # -*- coding: utf-8 -*-
+# Copyright (c) 2026 Yevhen Potapov. All rights reserved.
+# Part of ContentForge. See LICENSE in the repository root.
 """desc_block.py -- one place that builds the YouTube description footer:
 channel + code links + an honest "how this video was made" note.
 
