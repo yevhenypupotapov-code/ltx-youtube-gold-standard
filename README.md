@@ -45,4 +45,4 @@ python run.py --engine long --lang ru --privacy public --segments 6
 - Приложение и панель: [contentforge](https://github.com/yevhenypupotapov-code/contentforge)
 - Канал: [YEVHEN POTAPOV](https://www.youtube.com/@yevhenpotapov5956)
 
-<p align="center"><sub>Локальные модели · Windows · 2026</sub></p>
+<p align="center"><sub>© 2026 Yevhen Potapov · Все права защищены · Локальные модели · Windows</sub></p>
