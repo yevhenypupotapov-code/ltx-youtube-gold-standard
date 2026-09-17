@@ -1,91 +1,110 @@
-# ltx-youtube-gold-standard
+# LTX → YouTube на YEVGEN (RTX 3070 Laptop 8GB)
 
-Private Gold Standard **v3.0** package for the LTX hybrid YouTube assembler (PASS).
+ComfyUI у тебя уже живой: `http://127.0.0.1:8188`, выход смотрим в `D:\Tutorial\Output` и `ComfyUI\output`.
 
-**No secrets / no media pools** are included. Point env vars at your local ComfyUI + pools.
+## Что такое LTX-Video
 
-## Package layout
+Семейство открытых DiT-моделей Lightricks (Facetune / Videoleap): text-to-video и image-to-video.
 
-| Path | Role |
-|------|------|
-| `video_assembler.py` | Timeline assemble, hold≤5s, phash, slidewin, hybrid mix |
-| `shot_gate.py` | YOLO / CLIP / OCR / luma gates |
-| `photo_fallback.py` | Photoreal desk stills from local `fallback_pool/` |
-| `run.py` | Factory entry (`--engine long`) |
-| `config/*.yaml` | Gold runtime + canonical twin |
-| `GOLD_STANDARD_v3.md` | Human checklist + gate table |
-| `.github/workflows/ci.yml` | Syntax + YAML + secret-scrub CI |
+На этой машине уже стоит **локальный LTX-2.5 22B distilled INT8** (transformer + Gemma 4 + video/audio VAE). С 17 августа у тебя в `ComfyUI\output\video` лежат `LTX-2.5_i2v_*.mp4` и `LTX_2.5_t2v_*.mp4` — то есть 2.5 на 8GB у тебя уже оживает, просто медленно и с offload.
 
-## Quick start
+Для автопайплайна надёжнее стартовать с **LTXV 2B distilled FP8**: один файл ~4.5 ГБ, изначально целился в 8GB, 768×512, 49 кадров (~2 сек), 8 шагов.
 
-```bash
-cp .env.example .env   # edit paths
-pip install -r requirements.txt
-# populate ./fallback_pool with dark-office desk photos (not shipped)
-python -m py_compile run.py video_assembler.py shot_gate.py photo_fallback.py
+Не путай шаблон ComfyUI `api_ltx2_5_*` — это **облако Lightricks** (`LtxApi25TextToVideo`), не твой GPU. Локальный 2.5 шаблон: `Templates → Video → Text to Video (LTX-2.5)`.
+
+## Что качать (2B, для этого скрипта)
+
+| Файл | Куда | URL |
+|---|---|---|
+| `ltxv-2b-0.9.8-distilled-fp8.safetensors` (~4.46 GB) | `D:\ComfyUI\ModelHub\models\checkpoints` | [Hugging Face](https://huggingface.co/Lightricks/LTX-Video/resolve/main/ltxv-2b-0.9.8-distilled-fp8.safetensors) |
+| `t5xxl_fp8_e4m3fn.safetensors` (~4.9 GB) | `D:\ComfyUI\ModelHub\models\text_encoders` | [Hugging Face](https://huggingface.co/comfyanonymous/flux_text_encoders/resolve/main/t5xxl_fp8_e4m3fn.safetensors) |
+
+Либо из этой папки:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\download_ltxv_2b.ps1
 ```
 
----
+2.5 у тебя **уже скачан**, качать ещё раз не надо:
 
-﻿# GOLD STANDARD v3.0 — Winning Configuration
+- `diffusion_models\ltx-2.5-22b-distilled-transformer-comfy-int8-convrot.safetensors`
+- `text_encoders\gemma4-12b-with-proj-ltx-2.5-comfy-int8-convrot.safetensors`
+- `vae\ltx-2.5-video-vae-bf16.safetensors` + `ltx-2.5-audio-vae-bf16.safetensors`
+- `latent_upscale_models\ltx-2.5-latent-spatial-upscaler-x2-bf16-1.0.safetensors`
 
-**Purpose / Назначение:** зафиксировать проверенный PASS-конфиг для ежедневной фабрики LTX hybrid (11:00 / 18:00) и handoff. Не трогать Autopilot.
+Дубль `ltx-2.5-22b-... (1).safetensors` можно удалить — это копия на 20 ГБ.
 
-**PASS proof:** https://youtu.be/58K_BqdM-_E  
-**Density note:** ~28s dense beats > 44s padded junk. Держать visual density: `min_unique_per_sec: 5.0`, hold ≤ 5.0s.
+Настройки 2B на 8GB: **768×512, 49 кадров (8n+1), 8 steps, cfg=1, euler**. Промпт длинный, на английском.
 
-**Loaded by code:** `config/video_assembler.yaml` via `video_assembler.load_assembler_config()`  
-**Canonical twin:** `config/gold_standard_v3.yaml` (same keys)  
-**Gate constants also in:** `shot_gate.py` (YOLO/CLIP/OCR/luma), `run.py` (hybrid ~30% LTX + SAFETY_NEGATIVE + cinematic pan bias)
+## Workflow
 
----
+Готовые API-графы (то, что жрёт `/prompt`):
 
-## Gates table / Таблица гейтов
+- `workflows/ltxv_2b_t2v_api.json`
+- `workflows/ltxv_2b_i2v_api.json`
 
-| Gate | Threshold | Notes |
-|------|-----------|--------|
-| **YOLO** person/hand/arm/face | conf ≥ **0.15** → reject | other classes **0.25** if applicable |
-| **CLIP allowlist** | max sim ≥ **0.22** | desk, technology, computer monitor, keyboard, workspace, dark office |
-| **OCR** (RapidOCR) | text area ratio ≤ **0.05** | brand logos on hardware OK if small |
-| **Dark** | avg_luma ≤ **100** | Laplacian insurance `min_laplacian_var: 100` if present |
-| **Rhythm slidewin** | deque **maxlen=2** on `super_category` | no repeat inside window of 2 |
-| **Hold** | ≤ **5.0s** | hard cap on stills / KenBurns / concat |
-| **phash** | near-dup ban anywhere | `phash_near_dup_max: 55` |
-| **Reuse** | global `used_ids`; gap ≥ **30s** after pool exhaust | never reuse while unused remain |
+Для локального **LTX-2.5**: в ComfyUI открой шаблон Text to Video (LTX-2.5) → **File → Export (API)** → сохрани как `workflows/ltx25_t2v_api.json`. Потом:
 
----
+```text
+python generate_and_upload.py --workflow workflows/ltx25_t2v_api.json --prompt "..." --no-upload
+```
 
-## Hybrid rules / Гибрид
+На 8GB в 2.5 не ставь 1280×720 из шаблона. ResolutionSelector: **0.2–0.4 MP** (608×352 … 864×480), 5 секунд, `prompt_enhance=false`.
 
-- **~70% stills / ~30% LTX** (slot pattern: 1 LTX per ~3–4 stills).
-- LTX проходит **те же гейты** (YOLO + CLIP + luma + OCR + motion).
-- LTX fail → **still той же / совместимой `super_category`** (pool pick + slidewin).
-- LTX negatives: people, hands, faces, text, ui, bright, white, daylight.
-- Prompt bias: **slow cinematic pan** / dark tech desk (parallax, moody).
-- Brand logos on hardware — OK (малый текст / OCR area).
+## Скрипт
 
----
+```powershell
+cd D:\Tutorial\ltx-youtube
+copy config.example.json config.json
+D:\ComfyUI\ComfyUI_windows_portable\python_embeded\python.exe -m pip install -r requirements.txt
 
-## Daily checklist / Ежедневный чеклист (11:00 & 18:00)
+# только генерация, без YouTube
+D:\ComfyUI\ComfyUI_windows_portable\python_embeded\python.exe generate_and_upload.py `
+  --mode t2v --no-upload `
+  --prompt "A cinematic close-up of a red fox walking through fresh snow at golden hour, steam rising from its breath, slow camera pan, highly detailed fur, natural lighting. No text."
+```
 
-1. ComfyUI + Ollama up (`run_scheduled.ps1` стартует при необходимости).
-2. Pool: `fallback_pool/` ≥ `min_items_required` (10), dark-office tags only.
-3. **Weekly:** rotate pool 2–3 fresh stills (same allowlist theme).
-4. **Monitor LTX negatives** в логах (`logs/ltx_*.log`) — people/hands/faces/text/ui/bright rejects.
-5. **Monthly:** log YOLO/OCR reject counts (reason tags) → trim pool / prompts.
-6. Schedule: Schedule wrapper → `run.py --engine long` (gold defaults). Set `LTX_FACTORY`, `LTX_COMFY_PY`, `LTX_OUTPUT_DIR`, `LTX_FFMPEG` as needed.
+I2V:
 
----
+```powershell
+...\python.exe generate_and_upload.py --mode i2v --image C:\path\frame.png --no-upload --prompt "The fox turns its head toward the camera, snow drifting, cinematic lighting."
+```
 
-## File map
+ComfyUI должен быть запущен. Скрипт ставит промпт в очередь, ждёт mp4, печатает путь.
 
-| Path | Role |
-|------|------|
-| `config/video_assembler.yaml` | runtime config (code loads) |
-| `config/gold_standard_v3.yaml` | canonical documented twin |
-| `GOLD_STANDARD_v3.md` | this human doc |
-| `shot_gate.py` | YOLO/CLIP/OCR/luma constants |
-| `run_scheduled.ps1` | 11:00/18:00 wrapper |
-| Env vars | `LTX_FACTORY`, `LTX_COMFY_PY`, `LTX_OUTPUT_DIR`, `LTX_FFMPEG` |
+## YouTube
 
-Backup prefix before edits: `*.bak.pre-gold-v3-YYYYMMDD-HHMM`
+1. [Google Cloud Console](https://console.cloud.google.com/) → проект → Enable **YouTube Data API v3**.
+2. OAuth client type **Desktop app** → скачай JSON → положи как `client_secrets.json` сюда.
+3. Первый запуск откроет браузер (один раз), токен сохранится в `youtube_token.json`.
+4. По умолчанию заливка **private**. Public/массовая автозаливка — это ToS YouTube, спам и дубли банят.
+
+```powershell
+...\python.exe generate_and_upload.py --mode t2v --prompt "..." --title "Fox test" --privacy private
+```
+
+## Чего ComfyUI сам не сделает
+
+Уникальные заголовки, SEO, обложка, расписание Shorts. Это следующий слой (локальная LLM / отдельный скрипт). Сначала один стабильный mp4 в `output`, потом автопубликация.
+
+
+## Один проект с твоим video_factory
+
+Старый завод не удалял. AUTOPILOT по расписанию живёт в `C:\Users\yevhe\.openclaw\workspace`.
+LTX подключён к тому же `token.pickle` и `topics_history.json`.
+
+Единая точка входа:
+
+```powershell
+cd D:\Tutorial\ltx-youtube
+# LTX-клип, без заливки
+D:\ComfyUI\ComfyUI_windows_portable\python_embeded\python.exe run.py --engine ltx --no-upload --prompt "A red fox in snow, cinematic, no text"
+
+# тема + сценарий с завода, картинка из LTX, заливка тем же YouTube-токеном
+...\python.exe run.py --engine hybrid --topic "Local LLMs vs cloud" --lang en --privacy private
+
+# старый 16:9 слайд-завод
+python run.py --engine slides --lang ru --minutes 6 --no-upload
+```
+
+`--privacy` по умолчанию private, чтобы не пересечься с AUTOPILOT, который уже льёт public.
