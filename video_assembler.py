@@ -1,4 +1,6 @@
 #!/usr/bin/env python3
+# Copyright (c) 2026 Yevhen Potapov. All rights reserved.
+# Part of ContentForge. See LICENSE in the repository root.
 """Quality-control timeline assembler for LTX YouTube factory (TZ v2.1).
 
 Assembles approved LTX clips + diversified fallback stills into a timeline that:
